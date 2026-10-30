@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CorridorKey 2.0 Quick Start</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #5d5d63; --line: #e2e0da;
+  --accent: #2f6fe0; --key: #5594ff; --preview: #5bdb78; --busy: #ff9a26; --warn: #b3261e;
+  --code: #efede8;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #18181a; --panel: #222225; --ink: #ececee; --muted: #a3a3aa; --line: #333338;
+    --accent: #7aa7ff; --warn: #ff8a80; --code: #2c2c30;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #18181a; --panel: #222225; --ink: #ececee; --muted: #a3a3aa; --line: #333338;
+  --accent: #7aa7ff; --warn: #ff8a80; --code: #2c2c30;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+main { max-width: 760px; margin: 0 auto; padding: 40px 16px 72px; }
+h1 { font-size: 2rem; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.01em; }
+.lede { color: var(--muted); margin: 0 0 32px; font-size: 1.05rem; }
+h2 { font-size: 1.25rem; margin: 40px 0 12px; display: flex; gap: 12px; align-items: baseline; }
+h2 .n {
+  flex: none; width: 28px; height: 28px; border-radius: 50%; background: var(--accent); color: #fff;
+  font-size: .9rem; display: inline-grid; place-items: center; transform: translateY(-2px);
+}
+h3 { font-size: 1rem; margin: 20px 0 6px; }
+p, li { max-width: 68ch; }
+ul, ol { padding-left: 1.3em; }
+li { margin: 4px 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+.ui { font-weight: 600; }
+kbd, code {
+  font: .88em ui-monospace, "Cascadia Mono", Consolas, monospace; background: var(--code);
+  border-radius: 4px; padding: 1px 5px;
+}
+.bars { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; margin: 10px 0 0; }
+.bar { width: 44px; height: 5px; border-radius: 2px; }
+table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+th, td { text-align: left; vertical-align: top; padding: 10px 8px; border-top: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; border-top: none; }
+td:first-child { font-weight: 600; width: 34%; }
+.warn { color: var(--warn); font-weight: 600; }
+footer { margin-top: 48px; color: var(--muted); font-size: .9rem; border-top: 1px solid var(--line); padding-top: 16px; }
+a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+<h1>CorridorKey 2.0 Quick Start</h1>
+<p class="lede">CorridorKey 2.0 puts Corridor Digital's AI keyer inside a Blender material, so a footage plane shows its key in the viewport and in renders. This page gets you from a plane to a rendered key.</p>
+
+<div class="card">
+<strong>Where things are</strong>
+<ul>
+<li>3D Viewport: press <kbd>N</kbd> and open the <span class="ui">CorridorKey 2.0</span> tab. Most of the work happens here.</li>
+<li>Right-click a plane: <span class="ui">Set Up CorridorKey 2.0</span>.</li>
+<li>Shader Editor: <span class="ui">Add &gt; Texture &gt; CorridorKey 2.0</span>, with its controls in the sidebar's <span class="ui">Node</span> tab.</li>
+<li>The <span class="ui">?</span> button in the panel opens this guide.</li>
+</ul>
+</div>
+
+<h2><span class="n">1</span>Pick an engine</h2>
+<p>CorridorKey 2.0 can run on either of two engines. The <span class="ui">Engine</span> menu at the top of the panel picks one; <span class="ui">Automatic</span> uses Corridor's add-on when it's enabled and the free one otherwise.</p>
+<table>
+<tr><th>Engine</th><th>What you need</th></tr>
+<tr><td>Corridor Add-on (paid)</td><td>Corridor Digital's CorridorKey add-on, installed and enabled in Blender.</td></tr>
+<tr><td>Free (GitHub)</td><td>Windows with an NVIDIA GPU. Click <span class="ui">Install CorridorKey 2.0 (free)</span>: it downloads the open-source CorridorKey 2.0 with PyTorch and its models (several GB) in a window you can watch.</td></tr>
+</table>
+
+<h2><span class="n">2</span>Save your file</h2>
+<p>Save the .blend in your project folder, near the footage, before you key anything. Keys are saved in a <code>CorridorKey</code> folder next to the .blend, and the footage is found by a path relative to it.</p>
+<p class="warn">Don't work from an autosave in Temp or Recover.</p>
+<p>Its relative paths point into Temp, so the footage and keys go missing and Blender shows pink frames. The panel warns you when this happens.</p>
+
+<h2><span class="n">3</span>Set up the plane in one click</h2>
+<p>Select the plane that shows your footage, then click <span class="ui">Set Up CorridorKey 2.0</span>. It:</p>
+<ul>
+<li>puts a CorridorKey 2.0 node between the footage texture and the shader</li>
+<li>uses the plane's matte as the Alpha Hint, if it has one (Jetset and Autoshot planes usually do)</li>
+<li>turns off a compositor key that would render over CorridorKey's</li>
+<li>previews the frame you're on, which loads the model in the background</li>
+</ul>
+<p>The <span class="ui">Getting Started</span> checklist at the top of the panel ticks off the engine, footage, saved file and Render Folder, with a button beside anything still to do. It disappears once all four are done.</p>
+
+<h2><span class="n">4</span>Preview</h2>
+<p>The first preview takes about 25 seconds while the model loads. After that a frame takes about a second, as long as the model stays loaded.</p>
+<ul>
+<li><span class="ui">Preview Frame</span> keys the frame you're on.</li>
+<li><span class="ui">Live</span> keys each frame you stop on.</li>
+<li><span class="ui">Quick Preview</span> keys each frame on its own, which is faster but rougher. Renders always use the full settings.</li>
+<li><span class="ui">Cache Ahead</span> keys frames outward from the playhead while you're not playing, a batch at a time, up to the <span class="ui">Radius</span>.</li>
+<li>To preview a stretch of frames, use <span class="ui">Some Frames</span> in the Render box and click <span class="ui">Preview</span>. Nothing is written to your key.</li>
+</ul>
+<p>Previews are cached for the exact settings you made them with. Changing a setting starts a new cache, and the trash button clears the old ones.</p>
+<div class="card">
+<strong>Reading the timeline</strong>
+<div class="bars">
+<span class="bar" style="background:var(--key)"></span><span>Blue: the rendered key. It grows frame by frame while a render runs.</span>
+<span class="bar" style="background:var(--preview)"></span><span>Green: previewed with the current settings.</span>
+<span class="bar" style="background:var(--busy)"></span><span>Orange: being keyed right now.</span>
+</div>
+</div>
+
+<h2><span class="n">5</span>Alpha Hint (optional)</h2>
+<p>An Alpha Hint is a rough black-and-white matte of what to keep. It helps with hard shots such as hair, motion blur or a spill-heavy screen. If your plane has no matte, the <span class="ui">Alpha Hint Maker</span> can make one with Meta's SAM 3:</p>
+<ol>
+<li>Click <span class="ui">Install SAM 3</span>. It's free under Meta's SAM License, a download of about 7 GB.</li>
+<li>Type what to keep, for example <code>person</code>.</li>
+<li>Choose <span class="ui">All Frames</span> or <span class="ui">Single Frame</span>.</li>
+<li>Click <span class="ui">Make Alpha Hint</span>. It plugs itself into the node when it's done.</li>
+</ol>
+
+<h2><span class="n">6</span>Render the key</h2>
+<p>Everything that renders is in the panel's <span class="ui">Render</span> box.</p>
+<ul>
+<li><span class="ui">Whole Shot</span> then <span class="ui">Render Shot</span> keys every frame into a new Render folder. When it finishes, Live and Cache Ahead switch off, because every frame is keyed.</li>
+<li><span class="ui">Some Frames</span>: set <span class="ui">From</span> and <span class="ui">To</span> (the clock button copies the timeline's preview range, or the frame you're on). Then <span class="ui">Render</span> them with the full settings, or <span class="ui">Preview</span> them. <span class="ui">Current Key</span> replaces those frames in your key (to fix a few frames). <span class="ui">New Test Folder</span> keeps them apart (to try settings).</li>
+<li>While anything renders, the button becomes <span class="ui">Cancel Render</span>.</li>
+<li><kbd>F12</kbd>: with <span class="ui">Key the Frame Before F12</span> on, the frame you're on is keyed first, so a still render always has a fresh key.</li>
+<li><span class="ui">Delete Render</span> moves the shown key to the Recycle Bin, and <span class="ui">Open Folder</span> shows it in Explorer. Below the panel, <span class="ui">Reset</span> puts the settings back to their defaults and clears the previews; your footage, Render Folder and finished key stay.</li>
+</ul>
+
+<h2><span class="n">7</span>Send it to a render farm</h2>
+<p>A render farm (SheepIt, a studio farm, another computer) doesn't have this add-on. Once the key is right, lock it:</p>
+<ol>
+<li>Render the whole shot, or at least every frame in the scene's frame range. Lock refuses while any of those frames is missing, and tells you which ones.</li>
+<li>Click <span class="ui">Lock</span> under <span class="ui">Render Farm</span>, at the bottom of the Render box. <span class="ui">Lock All</span>, or <span class="ui">Render &gt; Lock CorridorKey for Render Farm</span>, locks every CorridorKey node in the file.</li>
+<li>Save, and send the .blend together with its <code>CorridorKey</code> folder, which holds the keyed frames.</li>
+</ol>
+<p>A locked node is plain Blender nodes playing the finished key. It renders the same with or without the add-on, and the add-on leaves it alone. <span class="ui">Unlock</span> hands it back, with your settings, for previews and re-renders.</p>
+
+<h2><span class="n">8</span>If something looks wrong</h2>
+<table>
+<tr><th>You see</th><th>Try</th></tr>
+<tr><td>Pink frames</td><td>The footage or key isn't where the .blend expects it. Use <span class="ui">Find Missing Files</span> and save the .blend in its project folder. A partial render shows the footage on the frames it didn't reach.</td></tr>
+<tr><td>The render shows the raw plate or a different key</td><td>The compositor is keying the plate again over CorridorKey's key. Click <span class="ui">Turn Off Compositing</span> in the warning.</td></tr>
+<tr><td>A full path warning</td><td><span class="ui">Make Paths Relative</span>, so the project still works after you move or copy its folder.</td></tr>
+<tr><td>Out of GPU memory</td><td>Turn on Low GPU Memory, lower the Internal Resolution, key a shorter range, or close other apps that use the GPU.</td></tr>
+<tr><td>The first preview is slow</td><td>That's the model loading, about 25 s. Later previews are quick. After a while idle the model leaves the GPU and comes back in a few seconds.</td></tr>
+</table>
+
+<footer>
+CorridorKey is by Corridor Digital. The free engine is <a href="https://github.com/nikopueringer/CorridorKey2.0">CorridorKey 2.0 on GitHub</a>. SAM 3 is by Meta (<a href="https://github.com/facebookresearch/sam3">facebookresearch/sam3</a>) under the SAM License.
+</footer>
+</main>
+</body>
+</html>
