@@ -4,9 +4,13 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 > Not made by or affiliated with Corridor Digital. CorridorKey is theirs; this add-on drives either their paid Blender add-on or the free, open-source CorridorKey 2.0.
 
+![A green-screen plate keyed live on a plane in Blender's viewport, with the CorridorKey 2.0 sidebar, the rendered key on the timeline and the node in the Shader Editor](docs/images/overview.png)
+
 ## Features
 
 - **Shader node:** add it from **Add > Texture > CorridorKey 2.0**. It has Image and Alpha Hint inputs, and Color and Alpha outputs.
+
+  ![The CorridorKey 2.0 node between the footage and matte textures and the material's shaders](docs/images/nodes.png)
 - **One-click Set Up:** right-click a footage plane and choose **Set Up CorridorKey 2.0**. It wires the node between the footage and the shader, and uses the plane's matte as the Alpha Hint. It also turns off a compositor key (Jetset/Autoshot) that would cover CorridorKey's.
 - **Controls in the 3D viewport sidebar:** press N and open the **CorridorKey 2.0** tab. A Getting Started checklist covers the engine, footage, saved file and Render Folder, and warnings catch common problems: full paths, missing files, compositing.
 - **Previews:**
@@ -15,10 +19,14 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
   - **Cache Ahead**, which keys frames outward from the playhead, like After Effects.
   - The model stays loaded between previews, so later frames take about a second.
 - **Timeline bars:** blue for the rendered key (it grows frame by frame while a render runs), green for previews, orange for frames being keyed.
+
+  ![The blue rendered-key bar across the whole shot on Blender's timeline](docs/images/timeline.png)
 - **Render box:**
   - **Whole Shot**, or **Some Frames** to re-render or test a stretch, into the current key or a new test folder.
   - F12 keys the current frame first.
   - Delete Render.
+
+  <img src="docs/images/render_box.png" alt="The Render box: Whole Shot or Some Frames, Render Shot, the F12 option, the key's folder, Open Folder, Delete Render and Lock" width="260">
 - **Lock for Render Farm:** freezes the finished key into plain Blender nodes, so the material renders the same on machines without the add-on (SheepIt, farms, other computers). Unlock hands it back.
 - **SAM 3 alpha hints:** type what to keep (for example `person`) and make a matte for one frame or the whole shot. SAM 3 runs only when needed: it gets the GPU while it runs and frees it when it's done.
 - **Two engines:**
@@ -37,6 +45,8 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 
+<img src="docs/images/guide.png" alt="The first page of the quick-start guide that the ? button opens" width="520">
+
 ## Files
 
 | File | What it is |
@@ -47,6 +57,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 | `QUICKSTART.html` | The quick-start guide the **?** button opens |
 | `blender_manifest.toml` | Blender extension manifest |
 | `dist/` | Ready-to-install add-on zips, one per version |
+| `docs/images/` | The pictures in this README |
 
 ## Third-party software
 
