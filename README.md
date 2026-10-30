@@ -33,8 +33,8 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 ## Install
 
-1. Download this repository as a zip: **Code > Download ZIP**. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
-2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with the zip.
+1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.9.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
+2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 
 ## Files
@@ -46,6 +46,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 | `sam3_worker.py` | Worker that runs SAM 3 for alpha hints with its own Python |
 | `QUICKSTART.html` | The quick-start guide the **?** button opens |
 | `blender_manifest.toml` | Blender extension manifest |
+| `dist/` | Ready-to-install add-on zips, one per version |
 
 ## Third-party software
 
