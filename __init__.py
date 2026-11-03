@@ -2890,6 +2890,62 @@ def _lines(layout, text: str, icon: str = "NONE", width: int = 42) -> None:
         layout.label(text=part, icon=icon if i == 0 else ("BLANK1" if icon != "NONE" else "NONE"))
 
 
+_FRACTION = re.compile(r"(\d+)\s*(?:of|/)\s*(\d+)")
+_PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+
+def progress_of(line: str) -> float | None:
+    """How far along a status line says a job is ("12 of 240", "40%"), 0-1, or None."""
+    found = _FRACTION.search(line or "")
+    if found and int(found.group(2)) > 0:
+        return min(1.0, int(found.group(1)) / int(found.group(2)))
+    found = _PERCENT.search(line or "")
+    return min(1.0, float(found.group(1)) / 100.0) if found else None
+
+
+def draw_progress(layout, line: str, factor: float | None = None, icon: str = "TIME") -> None:
+    """A running job: a filling bar when its progress is known, its line of text otherwise."""
+    factor = progress_of(line) if factor is None else factor
+    if factor is None or not hasattr(layout, "progress"):
+        _lines(layout, line, icon, 34)
+        return
+    if len(line) <= 38:
+        layout.progress(factor=factor, type="BAR", text=line)
+        return
+    found = _FRACTION.search(line)
+    _lines(layout, line, icon, 34)
+    layout.progress(factor=factor, type="BAR",
+                    text=f"{found.group(1)} of {found.group(2)}" if found else f"{round(factor * 100)}%")
+
+
+class CORRIDORKEY_SHADER_OT_pick_render_folder(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.pick_render_folder"
+    bl_label = "Choose Render Folder"
+    bl_description = "Choose the folder the rendered key is saved in"
+
+    directory: bpy.props.StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE"})
+
+    def invoke(self, context, event):
+        src = self.source()
+        if src is not None and st(src).render_folder:
+            self.directory = bpy.path.abspath(st(src).render_folder)
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        src = self.source()
+        if src is None or not self.directory:
+            return {"CANCELLED"}
+        folder = self.directory
+        if bpy.data.filepath:
+            try:  # keep it relative to the .blend, so the project can move
+                folder = bpy.path.relpath(folder)
+            except ValueError:  # another drive
+                pass
+        st(src).render_folder = folder
+        return {"FINISHED"}
+
+
 def blend_problem() -> str | None:
     """Why the .blend isn't a safe home for a key yet, or None."""
     path = bpy.data.filepath
@@ -3094,15 +3150,22 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     settings = node.corridorkey_shader
     note = "keying" if previewing else (
         ("live + cache ahead" if settings.cache_ahead else "live") if settings.live_preview else "")
-    box = _fold(layout, settings, "ui_preview", "Preview", "HIDE_OFF", note)
+    def reset_button(header):
+        header.operator(CORRIDORKEY_SHADER_OT_reset.bl_idname, text="", icon="LOOP_BACK", emboss=False).uid = uid
+
+    box = _fold(layout, settings, "ui_preview", "Preview", "HIDE_OFF", note, reset_button)
     row = box.row(align=True)
+    row.scale_y = 1.5
     if previewing:
         row.operator(CORRIDORKEY_SHADER_OT_cancel_preview.bl_idname, icon="CANCEL").uid = uid
     else:
         row.operator(CORRIDORKEY_SHADER_OT_preview.bl_idname, icon="RENDER_STILL").uid = uid
     row.prop(node.corridorkey_shader, "live_preview", text="Live", toggle=True, icon="REC")
     if PREVIEW_LINE.get(uid) and uid not in RANGE_LINES:
-        box.label(text=PREVIEW_LINE[uid])
+        if previewing:
+            draw_progress(box, PREVIEW_LINE[uid])
+        else:
+            _lines(box, PREVIEW_LINE[uid], "INFO", 34)
     box.prop(node.corridorkey_shader, "quick_preview")
     row = box.row(align=True)
     row.enabled = settings.live_preview  # caching works with Live
@@ -3123,8 +3186,6 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     _draw_input(inputs, node, IMAGE_IN, footage)
     if in_shader_editor:
         inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
-
-    layout.operator(CORRIDORKEY_SHADER_OT_reset.bl_idname, icon="LOOP_BACK").uid = uid
     layout.separator()
 
     # The engine's own settings sections, drawn for the hidden compositor node (their Render
@@ -3466,6 +3527,19 @@ class CORRIDORKEY_SHADER_OT_lock(bpy.types.Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     every: bpy.props.BoolProperty(name="Every CorridorKey node in the file", default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        """Why the button is greyed, when it is: the node's lock check, in its own words."""
+        src = getattr(context, "active_node", None)
+        if not properties.every and src is not None and getattr(src, "node_tree", None) is not None:
+            try:
+                result, why = lock_check(src, context.scene)
+            except Exception:  # noqa: BLE001 - a tooltip must never fail
+                result, why = True, ""
+            if result is None and why:
+                return f"{why}\n\n{cls.bl_description}"
+        return cls.bl_description
 
     def execute(self, context):
         if self.every:
@@ -4044,13 +4118,16 @@ class _Folded:
         pass
 
 
-def _fold(layout, settings, prop: str, title: str, icon: str, note: str = ""):
+def _fold(layout, settings, prop: str, title: str, icon: str, note: str = "", header_extra=None):
     """A section that folds away (its open state saved on the node): the layout to draw into, or
-    a stand-in that draws nothing while it's closed. `note` shows in the header, open or closed."""
+    a stand-in that draws nothing while it's closed. `note` shows in the header, open or closed;
+    `header_extra(header)` adds small buttons at the header's right."""
     if isinstance(layout, _Folded):  # inside a folded section: nothing to draw
         return layout
     header, body = layout.panel_prop(settings, prop)
     header.label(text=f"{title}: {note}" if note else title, icon=icon)
+    if header_extra is not None:
+        header_extra(header)
     return body if body is not None else _Folded()
 
 
@@ -4100,8 +4177,11 @@ def draw_screen_key(layout, node, src) -> None:
         box.operator(CORRIDORKEY_SHADER_OT_cancel_screen_hint.bl_idname, icon="CANCEL").uid = uid
     else:
         box.operator(CORRIDORKEY_SHADER_OT_screen_hint.bl_idname, icon="IMPORT").uid = uid
-    if PREVIEW_LINE.get("screen:" + uid):
-        _lines(box, PREVIEW_LINE["screen:" + uid], "BLANK1", 34)
+    line = PREVIEW_LINE.get("screen:" + uid)
+    if uid in SCREEN_JOBS and line:
+        draw_progress(box, line)
+    elif line:
+        _lines(box, line, "BLANK1", 34)
 
 
 class CORRIDORKEY_SHADER_OT_screen_hint(_OnSource, bpy.types.Operator):
@@ -4295,9 +4375,11 @@ def draw_hint_maker(layout, node, src) -> None:
         box.operator(CORRIDORKEY_SHADER_OT_cancel_hint.bl_idname, icon="CANCEL").uid = uid
     else:
         box.operator(CORRIDORKEY_SHADER_OT_make_hint.bl_idname, icon="MOD_MASK").uid = uid
-    if PREVIEW_LINE.get("hint:" + uid):
-        for part in textwrap.wrap(PREVIEW_LINE["hint:" + uid], 44):
-            box.label(text=part)
+    line = PREVIEW_LINE.get("hint:" + uid)
+    if job and job.get("total"):
+        draw_progress(box, line or "Making the Alpha Hint", factor=(job.get("done") or 0) / job["total"])
+    elif line:
+        _lines(box, line, "NONE", 40)
 
 
 def _paid_op(name: str) -> str | None:
@@ -4315,16 +4397,23 @@ def draw_render(layout, node, src, scene) -> None:
     box = _fold(layout, settings, "ui_render", "Render", "RENDER_ANIMATION",
                 "rendering" if (range_job or shot_job) else "")
     box.context_pointer_set("active_node", src)  # Corridor's buttons act on the active node
+    busy = bool(range_job or shot_job)
     line = PREVIEW_LINE.get(uid) if uid in RANGE_LINES else state.render_line
-    if line:
-        _lines(box, line, "BLANK1" if not (range_job or shot_job) else "TIME", 34)
+    if busy and line:
+        draw_progress(box, line)
+    else:
+        # one status line: how the key stands, and the GPU it needs against what there is
+        row = box.row()
+        status = row.row()
+        status.label(text=(line or "not rendered").rstrip(".").capitalize(),
+                     icon="CHECKMARK" if result_ready(src) else "RENDER_RESULT")
+        gpu = "" if free else gpu_line(state)
+        if gpu:
+            side = row.row()
+            side.alignment = "RIGHT"
+            side.label(text=gpu, icon="MEMORY")
     if state.runtime_message:
         _lines(box, state.runtime_message, "ERROR", 34)
-    if not free:
-        for label, value in (("GPU needs", getattr(state, "gpu_memory_required", "")),
-                             ("GPU has", getattr(state, "gpu_memory_available", ""))):
-            if value:
-                box.label(text=f"{label}: {value}")
 
     box.row().prop(settings, "render_scope", expand=True)
     if settings.render_scope == "RANGE":
@@ -4335,7 +4424,7 @@ def draw_render(layout, node, src, scene) -> None:
         box.row().prop(settings, "range_into", expand=True)
 
     row = box.row(align=True)
-    row.scale_y = 1.3
+    row.scale_y = 1.5
     if range_job:
         row.operator(CORRIDORKEY_SHADER_OT_cancel_preview.bl_idname, text="Cancel Render", icon="CANCEL").uid = uid
     elif shot_job:
@@ -4359,28 +4448,50 @@ def draw_render(layout, node, src, scene) -> None:
     row = box.row()
     row.enabled = not shot_job
     row.prop(state, "display_rendered_frames", text="Show the Rendered Key")
-    box.prop(state, "render_folder", text="")
-    if not free and getattr(state, "render_folder_size", ""):
-        box.label(text=state.render_folder_size)
+
+    # the Render Folder as a line, not a path field (Blender paints those red at times when
+    # nothing is wrong), with its size, and buttons to choose, open and empty it
+    folder = state.render_folder or "not set"
+    size = "" if free else getattr(state, "render_folder_size", "")
+    row = box.row(align=True)
+    row.label(text=f"{folder}  ({size})" if size else folder, icon="FILE_FOLDER")
+    row.operator(CORRIDORKEY_SHADER_OT_pick_render_folder.bl_idname, text="", icon="FILEBROWSER").uid = uid
     row = box.row(align=True)
     if free:
-        row.operator(CORRIDORKEY_SHADER_OT_free_open_folder.bl_idname, text="Open Folder", icon="FILE_FOLDER").uid = uid
+        row.operator(CORRIDORKEY_SHADER_OT_free_open_folder.bl_idname, text="Open Folder", icon="FOLDER_REDIRECT").uid = uid
     elif _paid_op("open_render_folder"):
-        row.operator(_paid_op("open_render_folder"), text="Open Folder", icon="FILE_FOLDER").node_uid = uid
+        row.operator(_paid_op("open_render_folder"), text="Open Folder", icon="FOLDER_REDIRECT").node_uid = uid
     row.operator(CORRIDORKEY_SHADER_OT_delete_render.bl_idname, text="Delete Render", icon="TRASH").uid = uid
 
-    farm = box.column(align=True)
-    farm.separator()
-    farm.label(text="Render Farm", icon="NETWORK_DRIVE")
-    result, why = lock_check(src, scene)
-    if result is None:
-        _lines(farm, why, "BLANK1", 34)
-    row = farm.row(align=True)
-    row.enabled = result is not None
-    row.operator(CORRIDORKEY_SHADER_OT_lock.bl_idname, text="Lock", icon="LOCKED")
+    # Render Farm: one row; while there's nothing to lock the button is greyed and its tooltip
+    # says why
+    box.separator()
+    result, _why = lock_check(src, scene)
+    row = box.row(align=True)
+    row.label(text="Render Farm", icon="NETWORK_DRIVE")
+    buttons = row.row(align=True)
+    buttons.enabled = result is not None
+    buttons.operator(CORRIDORKEY_SHADER_OT_lock.bl_idname, text="Lock", icon="LOCKED")
     others = sum(1 for _n in shader_nodes())
     if others > 1:
-        farm.operator(CORRIDORKEY_SHADER_OT_lock.bl_idname, text=f"Lock All {others}", icon="LOCKED").every = True
+        row.operator(CORRIDORKEY_SHADER_OT_lock.bl_idname, text=f"All {others}", icon="LOCKED").every = True
+
+
+def result_ready(src) -> bool:
+    """Whether a rendered key is plugged in to show."""
+    result = src.node_tree.nodes.get(RESULT) if getattr(src, "node_tree", None) is not None else None
+    return result is not None and result.image is not None
+
+
+def gpu_line(state) -> str:
+    """The GPU a render needs against what the card has, short: "GPU 5.1 / 9.9 GB"."""
+    needs = getattr(state, "gpu_memory_required", "") or ""
+    has = getattr(state, "gpu_memory_available", "") or ""
+    if not re.search(r"\d", needs) or not re.search(r"\d", has):  # "Shown after the first render"
+        return ""
+    if needs.endswith(" GB") and has.endswith(" GB"):
+        return f"{needs[:-3]} / {has}"
+    return f"{needs} / {has}"
 
 
 def draw_paid_hint_settings(layout, src) -> None:
@@ -4406,9 +4517,9 @@ def draw_paid_controls(outer, src, scene, before_despill=None, before_help=None)
                 hook(outer)
         return
     state = panel.settings(src) if hasattr(panel, "settings") else st(src)
-    if hasattr(operators, "status_line"):
-        panel._line(layout, words.STATUS, operators.status_line(src, scene))
-    panel._line(layout, words.GPU_MEMORY, state.gpu_memory_line)
+    status = operators.status_line(src, scene) if hasattr(operators, "status_line") else ""
+    if status and status.strip("- "):  # a job's status (the render box has the rest)
+        panel._line(layout, words.STATUS, status)
     if state.licence_line:
         panel._line(layout, words.LICENSE, state.licence_line)
         layout.operator("corridorkey.manage_license", text=words.MANAGE_LICENSE)
@@ -4424,7 +4535,10 @@ def draw_paid_controls(outer, src, scene, before_despill=None, before_help=None)
         if hooks.get(key):
             hooks[key](outer)
             layout = engine_column(outer, src)  # Corridor's next sections go below ours
-        body = panel._section(layout, key, title, closed=closed) if closed else panel._section(layout, key, title)
+        # Corridor's sections under its own names (their open state shared with its panel),
+        # with icons like ours
+        header, body = layout.panel(f"corridorkey_{key}", default_closed=closed)
+        header.label(text=title, icon=SECTION_ICONS.get(key, "NONE"))
         if body:
             draw(body, src, state)
 
@@ -4908,9 +5022,13 @@ class CORRIDORKEY_SHADER_OT_free_open_folder(_OnSource, bpy.types.Operator):
         return {"FINISHED"}
 
 
+SECTION_ICONS = {"controls": "OPTIONS", "time_awareness": "TIME", "time": "TIME", "output": "OUTPUT",
+                 "despill": "MATFLUID", "help": "HELP"}
+
+
 def _section(layout, key: str, title: str, closed: bool = False):
     header, body = layout.panel(f"corridorkey2_free_{key}", default_closed=closed)
-    header.label(text=title)
+    header.label(text=title, icon=SECTION_ICONS.get(key, "NONE"))
     return body
 
 
@@ -5169,6 +5287,7 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_cancel_hint,
     CORRIDORKEY_SHADER_OT_screen_hint,
     CORRIDORKEY_SHADER_OT_screen_preset,
+    CORRIDORKEY_SHADER_OT_pick_render_folder,
     CORRIDORKEY_SHADER_OT_cancel_screen_hint,
     CORRIDORKEY_SHADER_OT_sam3_check,
     CORRIDORKEY_SHADER_OT_sam3_install,

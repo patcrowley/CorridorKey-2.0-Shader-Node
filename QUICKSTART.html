@@ -135,18 +135,19 @@ a { color: var(--accent); }
 <h2><span class="n">6</span>Render the key</h2>
 <p>Everything that renders is in the panel's <span class="ui">Render</span> box.</p>
 <ul>
+<li>The top line shows how the key stands and the GPU memory a render needs against what your card has. While anything renders it becomes a progress bar.</li>
 <li><span class="ui">Whole Shot</span> then <span class="ui">Render Shot</span> keys every frame into a new Render folder. When it finishes, Live and Cache Ahead switch off, because every frame is keyed.</li>
 <li><span class="ui">Some Frames</span>: set <span class="ui">From</span> and <span class="ui">To</span> (the clock button copies the timeline's preview range, or the frame you're on). Then <span class="ui">Render</span> them with the full settings, or <span class="ui">Preview</span> them. <span class="ui">Current Key</span> replaces those frames in your key (to fix a few frames). <span class="ui">New Test Folder</span> keeps them apart (to try settings).</li>
 <li>While anything renders, the button becomes <span class="ui">Cancel Render</span>.</li>
 <li><kbd>F12</kbd>: with <span class="ui">Key the Frame Before F12</span> on, the frame you're on is keyed first, so a still render always has a fresh key.</li>
-<li><span class="ui">Delete Render</span> moves the shown key to the Recycle Bin, and <span class="ui">Open Folder</span> shows it in Explorer. Below the panel, <span class="ui">Reset</span> puts the settings back to their defaults and clears the previews; your footage, Render Folder and finished key stay.</li>
+<li><span class="ui">Delete Render</span> moves the shown key to the Recycle Bin, and <span class="ui">Open Folder</span> shows it in Explorer. The folder button beside the Render Folder picks another folder. The <span class="ui">Reset</span> arrow in the Preview header puts the settings back to their defaults and clears the previews; your footage, Render Folder and finished key stay.</li>
 </ul>
 
 <h2><span class="n">7</span>Send it to a render farm</h2>
 <p>A render farm (SheepIt, a studio farm, another computer) doesn't have this add-on. Once the key is right, lock it:</p>
 <ol>
 <li>Render the whole shot, or at least every frame in the scene's frame range. Lock refuses while any of those frames is missing, and tells you which ones.</li>
-<li>Click <span class="ui">Lock</span> under <span class="ui">Render Farm</span>, at the bottom of the Render box. <span class="ui">Lock All</span>, or <span class="ui">Render &gt; Lock CorridorKey for Render Farm</span>, locks every CorridorKey node in the file.</li>
+<li>Click <span class="ui">Lock</span> on the <span class="ui">Render Farm</span> row, at the bottom of the Render box (while it's greyed out, its tooltip says why). <span class="ui">All</span> beside it, or <span class="ui">Render &gt; Lock CorridorKey for Render Farm</span>, locks every CorridorKey node in the file.</li>
 <li>Save, and send the .blend together with its <code>CorridorKey</code> folder, which holds the keyed frames.</li>
 </ol>
 <p>A locked node is plain Blender nodes playing the finished key. It renders the same with or without the add-on, and the add-on leaves it alone. <span class="ui">Unlock</span> hands it back, with your settings, for previews and re-renders.</p>
