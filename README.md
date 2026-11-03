@@ -1,6 +1,6 @@
 # CorridorKey 2.0 for Blender
 
-A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **shader node**. A footage plane shows its key in the 3D viewport and in renders. You get live previews, a cache on the timeline, F12 keying, SAM 3 alpha hints and render-farm locking.
+A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **shader node**. A footage plane shows its key in the 3D viewport and in renders. You get live previews, a cache on the timeline, F12 keying, SAM 3 alpha hints, a green/blue screen key and render-farm locking.
 
 > Not made by or affiliated with Corridor Digital. CorridorKey is theirs; this add-on drives either their paid Blender add-on or the free, open-source CorridorKey 2.0.
 
@@ -29,6 +29,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
   <img src="docs/images/render_box.png" alt="The Render box: Whole Shot or Some Frames, Render Shot, the F12 option, the key's folder, Open Folder, Delete Render and Lock" width="260">
 - **Lock for Render Farm:** freezes the finished key into plain Blender nodes, so the material renders the same on machines without the add-on (SheepIt, farms, other computers). Unlock hands it back.
 - **SAM 3 alpha hints:** type what to keep (for example `person`) and make a matte for one frame or the whole shot. SAM 3 runs only when needed: it gets the GPU while it runs and frees it when it's done.
+- **Screen Key:** a simple green/blue keyer for screen that CorridorKey leaves behind. **Clean the Key** multiplies the key's alpha by it live, inside the node. **Bake into Alpha Hint** multiplies it into your hint for every frame, so CorridorKey itself treats that screen as background. Tune it with **Show Matte**.
 - **Two engines:**
   - **Corridor Add-on (paid):** Corridor Digital's CorridorKey add-on for Blender.
   - **Free (GitHub):** [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0), with a one-click installer (Windows, NVIDIA GPU).
@@ -41,7 +42,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 ## Install
 
-1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.9.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
+1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.10.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
 2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 
@@ -54,6 +55,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 | `__init__.py` | The add-on: the node, panels, previews, renders, locking, SAM 3 hints |
 | `free_server.py` | Worker that runs the free CorridorKey 2.0 engine with its own Python |
 | `sam3_worker.py` | Worker that runs SAM 3 for alpha hints with its own Python |
+| `screen_key_worker.py` | Worker that bakes the screen key into the Alpha Hint, in a background Blender |
 | `QUICKSTART.html` | The quick-start guide the **?** button opens |
 | `blender_manifest.toml` | Blender extension manifest |
 | `dist/` | Ready-to-install add-on zips, one per version |

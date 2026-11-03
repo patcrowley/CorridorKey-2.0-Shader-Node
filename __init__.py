@@ -270,6 +270,26 @@ def new_free_source() -> bpy.types.Node:
     return src
 
 
+DESPILL = 0.7  # this add-on's default despill, for either engine
+
+
+def despill_default(src) -> None:
+    """Corridor's node keeps its own despill default: set ours on it (on its scale, 0-1 or a
+    percentage). The free engine's setting defaults to DESPILL already."""
+    if is_free_source(src):
+        return
+    state = st(src)
+    prop = state.bl_rna.properties.get("despill_amount")
+    if prop is None or prop.type not in {"FLOAT", "INT"}:
+        return
+    value = DESPILL * 100 if prop.subtype == "PERCENTAGE" or prop.hard_max > 1.5 else DESPILL
+    value = min(max(value, prop.hard_min), prop.hard_max)
+    try:
+        setattr(state, "despill_amount", round(value) if prop.type == "INT" else value)
+    except (TypeError, AttributeError):
+        pass
+
+
 def new_source(kind: str | None = None) -> bpy.types.Node:
     """A source for `kind` ('paid' or 'free'; the current engine when None)."""
     if (kind or engine()) == "free":
@@ -282,6 +302,7 @@ def new_source(kind: str | None = None) -> bpy.types.Node:
     ensure_inputs(src)
     if bpy.data.filepath:  # a saved file gets a Render Folder beside it; change it in the sidebar
         src.corridorkey.render_folder = "//CorridorKey/"
+    despill_default(src)
     if hasattr(ck_ops, "start_check"):
         ck_ops.start_check()
     return src
@@ -431,10 +452,11 @@ def _link(tree: bpy.types.NodeTree, from_socket, to_socket) -> bool:
     return True
 
 
-def wire(tree: bpy.types.NodeTree, mode: str) -> bool:
+def wire(tree: bpy.types.NodeTree, mode: str, screen=None) -> bool:
     """What the node puts out. "key": the rendered key. "input": what's plugged in, passed
     through (the Alpha Hint, when plugged in, as its Alpha) so the shot looks as it did until a key
-    lands. "plate": the footage picked in the sidebar."""
+    lands. "plate": the footage picked in the sidebar. `screen` (the node's settings): with Clean
+    the Key, the Alpha goes through the screen key; with Show Matte, the screen key is shown."""
     group_in = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
     group_out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
     texture = tree.nodes[TEXTURE]
@@ -442,8 +464,98 @@ def wire(tree: bpy.types.NodeTree, mode: str) -> bool:
         color, alpha = group_in.outputs[IMAGE_IN], group_in.outputs[HINT_IN]
     else:
         color, alpha = texture.outputs["Color"], texture.outputs["Alpha"]
-    changed = _link(tree, color, group_out.inputs["Color"])
+    changed = False
+    keyer = tree.nodes.get(SK_MAP)
+    if screen is not None and keyer is not None and (screen.screen_clean or screen.screen_show):
+        matte = keyer.outputs[0]
+        if screen.screen_show:
+            color, alpha = matte, None  # white kept, black taken out; opaque
+        else:
+            multiply = tree.nodes[SK_MULT]
+            changed |= _link(tree, alpha, multiply.inputs[0])
+            changed |= _link(tree, matte, multiply.inputs[1])
+            alpha = multiply.outputs[0]
+    changed |= _link(tree, color, group_out.inputs["Color"])
     changed |= _link(tree, alpha, group_out.inputs["Alpha"])
+    return changed
+
+
+# --- the screen key: a simple green/blue keyer, live in the node, or baked into the Alpha Hint ------
+
+SK_PLATE, SK_GAMMA, SK_SPLIT = "CK Screen Footage", "CK Screen Gamma", "CK Screen Channels"
+SK_MAX, SK_DIFF, SK_MAP, SK_MULT = "CK Screen Others", "CK Screen Difference", "CK Screen Matte", "CK Screen Clean"
+SK_GAMMA_VALUE = 1 / 2.2  # display-like values, as screen_key_worker.py judges them
+
+
+def _value_input(node, name: str):
+    return next(s for s in node.inputs if s.name == name and s.type == "VALUE")
+
+
+def ensure_screen_nodes(tree) -> bool:
+    """The keyer inside the shader group (made once): the footage, in display-like values, split
+    into channels; screen colour minus the larger other channel; a smoothstep from kept to out."""
+    if tree.nodes.get(SK_MULT) is not None:
+        return False
+    nodes, links = tree.nodes, tree.links
+    coords = next((n for n in nodes if n.bl_idname == "ShaderNodeTexCoord"), None) or nodes.new("ShaderNodeTexCoord")
+    plate = nodes.new("ShaderNodeTexImage")
+    plate.name = plate.label = SK_PLATE
+    plate.extension = "CLIP"
+    plate.location = (-200, -420)
+    links.new(coords.outputs["UV"], plate.inputs["Vector"])
+    gamma = nodes.new("ShaderNodeGamma")
+    gamma.name = SK_GAMMA
+    gamma.inputs["Gamma"].default_value = SK_GAMMA_VALUE
+    gamma.location = (60, -420)
+    links.new(plate.outputs["Color"], gamma.inputs["Color"])
+    split = nodes.new("ShaderNodeSeparateColor")
+    split.name = SK_SPLIT
+    split.location = (240, -420)
+    links.new(gamma.outputs["Color"], split.inputs["Color"])
+    others = nodes.new("ShaderNodeMath")
+    others.name, others.operation = SK_MAX, "MAXIMUM"
+    others.location = (420, -360)
+    difference = nodes.new("ShaderNodeMath")
+    difference.name, difference.operation = SK_DIFF, "SUBTRACT"
+    difference.location = (600, -420)
+    links.new(others.outputs[0], difference.inputs[1])
+    matte = nodes.new("ShaderNodeMapRange")
+    matte.name, matte.data_type, matte.interpolation_type = SK_MAP, "FLOAT", "SMOOTHSTEP"
+    matte.clamp = True
+    matte.location = (780, -420)
+    links.new(difference.outputs[0], _value_input(matte, "Value"))
+    _value_input(matte, "To Min").default_value = 1.0  # not screen: kept
+    _value_input(matte, "To Max").default_value = 0.0  # screen: taken out
+    multiply = nodes.new("ShaderNodeMath")
+    multiply.name, multiply.operation = SK_MULT, "MULTIPLY"
+    multiply.location = (960, -300)
+    return True
+
+
+def screen_update(tree, settings, plate) -> bool:
+    """The keyer's footage (the plate, timed as it plays), screen colour and tuning, from the
+    node's settings."""
+    changed = ensure_screen_nodes(tree)
+    nodes = tree.nodes
+    footage = nodes[SK_PLATE]
+    image = plate.image if plate is not None else None
+    changed |= _set(footage, "image", image)
+    if image is not None:
+        user = footage.image_user
+        for attr in ("frame_start", "frame_offset", "frame_duration"):
+            changed |= _set(user, attr, getattr(plate, attr))
+        changed |= _set(user, "use_auto_refresh", True)
+        changed |= _set(user, "use_cyclic", False)
+    split, others, difference = nodes[SK_SPLIT], nodes[SK_MAX], nodes[SK_DIFF]
+    screen, first, second = (("Green", "Red", "Blue") if settings.screen_color == "GREEN"
+                             else ("Blue", "Red", "Green"))
+    changed |= _link(tree, split.outputs[screen], difference.inputs[0])
+    changed |= _link(tree, split.outputs[first], others.inputs[0])
+    changed |= _link(tree, split.outputs[second], others.inputs[1])
+    matte = nodes[SK_MAP]
+    changed |= _set(_value_input(matte, "From Min"), "default_value", settings.screen_threshold)
+    changed |= _set(_value_input(matte, "From Max"), "default_value",
+                    settings.screen_threshold + max(settings.screen_softness, 0.001))
     return changed
 
 
@@ -1281,7 +1393,7 @@ class FreeControls:
     hint_quality: float = 0.95
     carry_hint: bool = True
     carry_hint_quality: float = 0.95
-    despill: float = 0.5
+    despill: float = 0.7
     output: str = "CUTOUT"
     preview_context: int = 4
 
@@ -1970,19 +2082,23 @@ def sync(
         shown_preview(src, scene, full_only=_RENDERING_WITH_KEY[0])
         if allow_preview and scene is not None else None
     )
+    settings = node.corridorkey_shader
+    screen_changed = False
+    if settings.screen_clean or settings.screen_show:
+        screen_changed = screen_update(node.node_tree, settings, wired_image_node(src, 0))
     if preview is not None:  # this frame has been previewed: show the cache, played as a sequence
         image = preview_image(src, *preview)
         plate = wired_image_node(src, 0)
-        changed = _set(texture, "image", image)
+        changed = screen_changed | _set(texture, "image", image)
         user = texture.image_user
         for attr in ("frame_start", "frame_offset", "frame_duration"):
             changed |= _set(user, attr, getattr(plate, attr))
         changed |= _set(user, "use_auto_refresh", True)
         changed |= _set(user, "use_cyclic", False)
-        return changed | wire(node.node_tree, "key")
+        return changed | wire(node.node_tree, "key", settings)
     shown = shown_frames(src, scene.frame_current if scene is not None else None)
     image = shown.image if shown is not None else None
-    changed = _set(texture, "image", image)
+    changed = screen_changed | _set(texture, "image", image)
     if image is not None:
         user = texture.image_user
         for attr in ("frame_start", "frame_offset", "frame_duration"):
@@ -1991,7 +2107,7 @@ def sync(
         changed |= _set(user, "use_cyclic", False)
     keyed = shown is not None and shown.name == RESULT
     plugged = node.inputs.get(IMAGE_IN) is not None and node.inputs[IMAGE_IN].is_linked
-    changed |= wire(node.node_tree, "key" if keyed else ("input" if plugged else "plate"))
+    changed |= wire(node.node_tree, "key" if keyed else ("input" if plugged else "plate"), settings)
     return changed
 
 
@@ -2005,6 +2121,7 @@ def tick() -> float:
             changed |= land_free_renders()
             changed |= land_paid_renders()
             changed |= land_hints()
+            changed |= land_screen_hints()
             if getattr(ck_ops, "JOBS", None):  # a paid render takes the card: previews wait
                 for uid in list(PREVIEW_JOBS):
                     cancel_preview(uid)
@@ -2345,6 +2462,31 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     hint_threshold: bpy.props.FloatProperty(
         name="Confidence", default=0.5, min=0.05, max=0.95,
         description="How sure SAM 3 must be: lower finds more, higher finds less",
+    )
+    screen_color: bpy.props.EnumProperty(
+        name="Screen",
+        items=[("GREEN", "Green", "Key out a green screen"), ("BLUE", "Blue", "Key out a blue screen")],
+        default="GREEN",
+    )
+    screen_threshold: bpy.props.FloatProperty(
+        name="Threshold", default=0.04, min=0.0, max=0.5, step=0.5, precision=3,
+        description="How green (or blue) a pixel must be before the screen key starts taking it "
+                    "out: lower takes out more, including shadowed screen",
+    )
+    screen_softness: bpy.props.FloatProperty(
+        name="Softness", default=0.08, min=0.001, max=0.5, step=0.5, precision=3,
+        description="How gradually the screen key fades from kept to taken out: higher gives softer edges",
+    )
+    screen_clean: bpy.props.BoolProperty(
+        name="Clean the Key",
+        description="Take the screen colour out of the key live, inside this node: the key's alpha "
+                    "times the screen key. Renders, and locks for a render farm, the same way",
+        default=False,
+    )
+    screen_show: bpy.props.BoolProperty(
+        name="Show Matte",
+        description="Show the screen key itself (white kept, black taken out) while you tune it",
+        default=False,
     )
 
 
@@ -2695,6 +2837,7 @@ class CORRIDORKEY_SHADER_OT_reset(_OnSource, bpy.types.Operator):
             if name == "rna_type" or name in _KEEP_ON_RESET or prop.is_hidden or prop.is_readonly:
                 continue
             state.property_unset(name)
+        despill_default(src)
         apply_display(src)  # "Display rendered frames?" is ticked again
         ck_ops = ck("operators")
         if not is_free_source(src) and hasattr(ck_ops, "queue_estimate"):
@@ -2935,6 +3078,7 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     if in_shader_editor:
         layout.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
     draw_hint_maker(layout, node, src)
+    draw_screen_key(layout, node, src)
 
     box = layout.box()
     box.label(text="Preview", icon="HIDE_OFF")
@@ -3214,12 +3358,18 @@ def lock_node(node, scene) -> tuple[bool, str]:
     user.frame_start, user.frame_offset = result.frame_start, result.frame_offset
     user.frame_duration = max(result.frame_duration, 1)
     user.use_auto_refresh, user.use_cyclic = True, False
-    wire(locked, "key")
+    settings = node.corridorkey_shader
+    if settings.screen_clean:  # the screen key goes with it: the farm renders the same clean key
+        plate = wired_image_node(src, 0)
+        screen_update(locked, settings, plate)
+        if plate is not None and plate.image is not None and not plate.image.filepath.startswith("//"):
+            notes.append("Clean the Key reads the footage too: the farm needs it at the same path")
+    wire(locked, "key", types.SimpleNamespace(screen_clean=settings.screen_clean, screen_show=False))
     original.use_fake_user = True  # kept, unused, for Unlock (and so its source isn't tidied away)
     node.node_tree = locked
     node.label = f"{NAME} (locked)"
-    settings = node.corridorkey_shader
     settings.live_preview = settings.cache_ahead = False
+    settings.screen_show = False
     return True, "; ".join(notes)
 
 
@@ -3592,14 +3742,16 @@ def plug_hint(node, job: dict) -> int:
     tree = node.id_data
     footage = _texture_of(node, IMAGE_IN)
     image = bpy.data.images.load(os.path.join(folder, files[0]), check_existing=False)
-    image.name = f"SAM 3 hint: {job['prompt']}"
+    image.name = job.get("image_name") or f"SAM 3 hint: {job['prompt']}"
     image.source = "SEQUENCE" if len(files) > 1 else "FILE"
     try:
         image.colorspace_settings.name = "Non-Color"
     except TypeError:
         pass
     texture = tree.nodes.new("ShaderNodeTexImage")
-    texture.label = f"Alpha Hint (SAM 3: {job['prompt']})"
+    texture.label = job.get("label") or f"Alpha Hint (SAM 3: {job['prompt']})"
+    if job.get("base"):  # a screen-key hint remembers the hint it was made from, for the next bake
+        texture[SCREEN_BASE] = json.dumps(job["base"])
     texture.image = image
     texture.interpolation = "Linear"
     if footage is not None:
@@ -3659,6 +3811,207 @@ def land_hints() -> bool:
         else:
             PREVIEW_LINE["hint:" + uid] = f"SAM 3: {job.get('message') or 'it stopped'}"
     return changed
+
+
+SCREEN_BASE = "corridorkey_screen_base"  # on a screen-key hint's texture: the hint it was made from
+SCREEN_JOBS: dict[str, dict] = {}  # source uid -> the screen key being baked into the hint
+
+
+def _hint_base(node, src) -> dict | None:
+    """The hint a screen-key bake multiplies into: the one plugged in now, or, when that is an
+    earlier screen-key bake, the hint that bake was made from (so tuning and baking again never
+    compounds). {"path", "kind": "SEQUENCE" | "FILE" | "MOVIE", "name"} or None."""
+    texture = _texture_of(node, HINT_IN)
+    if texture is not None and texture.get(SCREEN_BASE):
+        try:
+            return json.loads(texture[SCREEN_BASE])
+        except (TypeError, ValueError):
+            pass
+    image = texture.image if texture is not None else None
+    if image is None and not (node.inputs.get(HINT_IN) and node.inputs[HINT_IN].is_linked):
+        hint = wired_image_node(src, 1)
+        image = hint.image if hint is not None else None
+    if image is None or not image.filepath:
+        return None
+    return {"path": bpy.path.abspath(image.filepath, library=image.library), "kind": image.source, "name": image.name}
+
+
+def start_screen_hint(node, scene) -> str | None:
+    """Bake the screen key into the Alpha Hint for the whole shot, in background Blenders: each
+    frame's screen key times the current hint, plugged in when it's done."""
+    src = source_of(node)
+    if src is None:
+        return "This node has no CorridorKey source yet."
+    uid = st(src).uid
+    if uid in SCREEN_JOBS:
+        return None
+    plate = wired_image_node(src, 0)
+    image = plate.image if plate is not None else None
+    if image is None or image.source != "SEQUENCE":
+        return "The screen key bakes from an image sequence (not a movie)."
+    folder = os.path.dirname(bpy.path.abspath(image.filepath, library=image.library))
+    plates = numbered(folder)
+    if not plates:
+        return "No footage frames found."
+    numbers = sorted(plates)
+    base = _hint_base(node, src)
+    note = ""
+    hints: dict[int, str | None] = {n: None for n in numbers}
+    if base is not None and base["kind"] == "SEQUENCE":
+        sequence = numbered(os.path.dirname(base["path"]))
+        if len(set(sequence) & set(numbers)) >= len(numbers) / 2:  # numbered like the footage
+            hints = {n: os.path.join(os.path.dirname(base["path"]), sequence[n]) if n in sequence else None
+                     for n in numbers}
+        else:  # numbered otherwise: frame for frame, in order
+            ordered = [sequence[k] for k in sorted(sequence)]
+            hints = {n: os.path.join(os.path.dirname(base["path"]), ordered[i]) if i < len(ordered) else None
+                     for i, n in enumerate(numbers)}
+    elif base is not None and base["kind"] in {"FILE", "TILED"} and os.path.isfile(base["path"]):
+        hints = {n: base["path"] for n in numbers}
+    elif base is not None:
+        note = " (the hint is a movie: the screen key alone)"
+        base = None
+    settings = node.corridorkey_shader
+    work = os.path.join(tempfile.gettempdir(), "CorridorKey Screen Key", uuid.uuid4().hex[:8])
+    os.makedirs(work)
+    out_dir = _hint_folder("screen key")
+    workers = max(1, min(4, (os.cpu_count() or 4) // 4))
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_key_worker.py")
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    processes = []
+    for index in range(workers):
+        request = {
+            "frames": [[n, os.path.join(folder, plates[n]), hints[n]] for n in numbers],
+            "color": settings.screen_color, "threshold": settings.screen_threshold,
+            "softness": settings.screen_softness, "out_dir": out_dir, "prefix": "hint_",
+            "slice": [index, workers],
+        }
+        path = os.path.join(work, f"request_{index}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(request, f)
+        try:
+            processes.append(subprocess.Popen(
+                [bpy.app.binary_path, "-b", "--factory-startup", "--python", script, "--", path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            ))
+        except OSError as exc:
+            for process in processes:
+                process.kill()
+            shutil.rmtree(work, ignore_errors=True)
+            return f"The screen key didn't start: {exc}"
+    with_hint = f"times '{base['name']}'" if base else "on its own"
+    SCREEN_JOBS[uid] = {
+        "processes": processes, "work": work, "out_dir": out_dir, "total": len(numbers),
+        "node": node.name, "material": _owner_name(node), "base": base, "started": time.monotonic(),
+        "what": f"{settings.screen_color.lower()} screen key {with_hint}{note}",
+    }
+    PREVIEW_LINE["screen:" + uid] = f"Baking the {SCREEN_JOBS[uid]['what']}..."
+    return None
+
+
+def cancel_screen_hint(uid: str) -> None:
+    job = SCREEN_JOBS.get(uid)
+    if job is not None:
+        job["cancelled"] = True
+        for process in job["processes"]:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+def land_screen_hints() -> bool:
+    """Screen-key bakes: how far along; the finished ones plugged into the Alpha Hint."""
+    changed = False
+    for uid, job in list(SCREEN_JOBS.items()):
+        try:
+            done = len([f for f in os.listdir(job["out_dir"]) if f.endswith(".png")])
+        except OSError:
+            done = 0
+        if any(process.poll() is None for process in job["processes"]):
+            line = f"Baking the {job['what']}: {done} of {job['total']} frames"
+            if PREVIEW_LINE.get("screen:" + uid) != line:
+                PREVIEW_LINE["screen:" + uid] = line
+                changed = True
+            continue
+        del SCREEN_JOBS[uid]
+        changed = True
+        errors = sorted(f for f in os.listdir(job["out_dir"]) if f.startswith("error_")) if os.path.isdir(job["out_dir"]) else []
+        message = ""
+        for name in errors:
+            with open(os.path.join(job["out_dir"], name), encoding="utf-8", errors="replace") as f:
+                message = message or f.read().strip()[:160]
+            os.remove(os.path.join(job["out_dir"], name))
+        shutil.rmtree(job["work"], ignore_errors=True)
+        material = bpy.data.materials.get(job["material"])
+        tree = material.node_tree if material is not None else bpy.data.node_groups.get(job["material"])
+        node = tree.nodes.get(job["node"]) if tree is not None else None
+        if job.get("cancelled"):
+            PREVIEW_LINE["screen:" + uid] = "Screen key bake stopped."
+        elif done < job["total"] or node is None:
+            PREVIEW_LINE["screen:" + uid] = f"Screen key bake stopped at {done} of {job['total']} frames" + (
+                f": {message}" if message else ".")
+        else:
+            count = plug_hint(node, {
+                "out_dir": job["out_dir"], "mode": "ALL", "frame": None, "prompt": "screen key",
+                "image_name": "Screen key hint", "label": f"Alpha Hint (screen key: {job['what']})",
+                "base": job["base"],
+            })
+            seconds = int(time.monotonic() - job["started"])
+            PREVIEW_LINE["screen:" + uid] = (f"Alpha Hint is now the {job['what']}: {count} frames "
+                                             f"in {seconds // 60}m {seconds % 60:02d}s.")
+    return changed
+
+
+def draw_screen_key(layout, node, src) -> None:
+    uid, settings = st(src).uid, node.corridorkey_shader
+    box = layout.box()
+    box.label(text="Screen Key (green/blue)", icon="IMAGE_ALPHA")
+    box.row().prop(settings, "screen_color", expand=True)
+    row = box.row(align=True)
+    row.prop(settings, "screen_threshold")
+    row.prop(settings, "screen_softness")
+    row = box.row(align=True)
+    row.prop(settings, "screen_clean", toggle=True, icon="BRUSH_DATA")
+    row.prop(settings, "screen_show", toggle=True, icon="HIDE_OFF")
+    if uid in SCREEN_JOBS:
+        box.operator(CORRIDORKEY_SHADER_OT_cancel_screen_hint.bl_idname, icon="CANCEL").uid = uid
+    else:
+        box.operator(CORRIDORKEY_SHADER_OT_screen_hint.bl_idname, icon="IMPORT").uid = uid
+    if PREVIEW_LINE.get("screen:" + uid):
+        _lines(box, PREVIEW_LINE["screen:" + uid], "BLANK1", 34)
+
+
+class CORRIDORKEY_SHADER_OT_screen_hint(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.screen_hint"
+    bl_label = "Bake into Alpha Hint"
+    bl_description = (
+        "Key the screen colour out of every frame and multiply it into the Alpha Hint (or use it "
+        "as the hint when there is none), so CorridorKey itself treats the leftover screen as "
+        "background. Runs in the background; the new hint plugs in when it's done"
+    )
+
+    def execute(self, context):
+        node = node_by_source(self.uid)
+        if node is None:
+            return {"CANCELLED"}
+        why = start_screen_hint(node, context.scene)
+        if why:
+            PREVIEW_LINE["screen:" + self.uid] = why
+            self.report({"WARNING"}, why)
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_cancel_screen_hint(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.cancel_screen_hint"
+    bl_label = "Stop Baking"
+    bl_description = "Stop baking the screen key into the Alpha Hint"
+
+    def execute(self, context):
+        cancel_screen_hint(self.uid)
+        return {"FINISHED"}
 
 
 def _node_of_uid(uid: str):
@@ -4197,7 +4550,7 @@ class CorridorKeyFreeSettings(bpy.types.PropertyGroup):
         name="Carried Hint Strength", default=0.95, min=0.0, max=1.0,
     )
     despill_strength: bpy.props.FloatProperty(
-        name="Despill", default=0.5, min=0.0, max=1.0,
+        name="Despill", default=DESPILL, min=0.0, max=1.0,
         description="How much green or blue spill is taken out of the cut-out (0 none, 1 full)",
     )
     output: bpy.props.EnumProperty(
@@ -4671,6 +5024,8 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_range_from_timeline,
     CORRIDORKEY_SHADER_OT_make_hint,
     CORRIDORKEY_SHADER_OT_cancel_hint,
+    CORRIDORKEY_SHADER_OT_screen_hint,
+    CORRIDORKEY_SHADER_OT_cancel_screen_hint,
     CORRIDORKEY_SHADER_OT_sam3_check,
     CORRIDORKEY_SHADER_OT_sam3_install,
     CORRIDORKEY_SHADER_OT_setup_plane,
