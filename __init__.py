@@ -2509,6 +2509,7 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     ui_screen: bpy.props.BoolProperty(name="Screen Key", default=False)
     ui_preview: bpy.props.BoolProperty(name="Preview", default=True)
     ui_render: bpy.props.BoolProperty(name="Render", default=True)
+    ui_tips: bpy.props.BoolProperty(name="Tips", default=True)
     screen_show: bpy.props.BoolProperty(
         name="Show Matte",
         description="Show the screen key itself (white kept, black taken out) while you tune it",
@@ -3118,31 +3119,46 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     sub.prop(node.corridorkey_shader, "cache_radius", text="Radius")
     sub.prop(node.corridorkey_shader, "cache_batch", text="Batch")
     cached = len(cached_frames(src, scene))
-    if not cached and uid not in PREVIEW_JOBS and not warm_alive():
-        note = box.column(align=True)
-        note.label(text="First preview: about 25 s", icon="TIME")
-        note.label(text="(the model loads). Then ~1 s a frame.", icon="BLANK1")
     if cached:
         row = box.row()
         row.label(text=f"{cached} frame{'s' if cached != 1 else ''} cached for these settings")
         row.operator(CORRIDORKEY_SHADER_OT_clear_previews.bl_idname, text="", icon="TRASH").uid = uid
-    if shown_preview(src, scene) is not None:
-        box.label(text="Showing the preview for this frame", icon="INFO")
-    box.label(text="Timeline: blue = key, green = preview")
-    box.label(text=warm_status(), icon="CHECKMARK" if warm_alive() else "TIME")
     layout.operator(CORRIDORKEY_SHADER_OT_reset.bl_idname, icon="LOOP_BACK").uid = uid
     layout.separator()
 
     # The engine's own settings sections, drawn for the hidden compositor node (their Render
-    # section is in the Render box above, their Alpha Hint section in ours below). Its buttons act
-    # on the editor's active node, so the source is handed to them as that node.
-    body = layout.column()
-    body.context_pointer_set("active_node", src)
+    # section is in the Render box above). Ours slot in between theirs: the Alpha Hint above
+    # Despill, the Tips above Help.
+    hooks = {"before_despill": lambda where: draw_alpha_hint(where, node, src, scene, hint),
+             "before_help": lambda where: draw_tips(where, node, src, scene)}
     if is_free_source(src):
-        draw_free_controls(body, src)
+        draw_free_controls(layout, src, **hooks)
     else:
-        draw_paid_controls(body, src, scene)
-    draw_alpha_hint(layout, node, src, scene, hint)
+        draw_paid_controls(layout, src, scene, **hooks)
+
+
+def engine_column(layout, src):
+    """A column for the engine's own sections. Their buttons act on the editor's active node, so
+    the hidden source is handed to them as that node."""
+    column = layout.column()
+    column.context_pointer_set("active_node", src)
+    column.use_property_split = True
+    column.use_property_decorate = False
+    return column
+
+
+def draw_tips(layout, node, src, scene) -> None:
+    """What the panel's colours and waits mean, in a section of their own."""
+    uid = st(src).uid
+    body = _fold(layout, node.corridorkey_shader, "ui_tips", "Tips", "INFO")
+    if not cached_frames(src, scene) and uid not in PREVIEW_JOBS and not warm_alive():
+        note = body.column(align=True)
+        note.label(text="First preview: about 25 s", icon="TIME")
+        note.label(text="(the model loads). Then ~1 s a frame.", icon="BLANK1")
+    if shown_preview(src, scene) is not None:
+        body.label(text="Showing the preview for this frame", icon="HIDE_OFF")
+    body.label(text="Timeline: blue = key, green = preview", icon="TIME")
+    body.label(text=warm_status(), icon="CHECKMARK" if warm_alive() else "SORTTIME")
 
 
 def _draw_input(layout, node, name: str, image_node) -> None:
@@ -4374,17 +4390,20 @@ def draw_paid_hint_settings(layout, src) -> None:
         panel._draw_alpha_hint(layout, src, state)
 
 
-def draw_paid_controls(layout, src, scene) -> None:
+def draw_paid_controls(outer, src, scene, before_despill=None, before_help=None) -> None:
     """Corridor's sections for the node, as its own panel draws them, less its Render section
-    (which is in the Render box)."""
+    (which is in the Render box), with ours drawn in between (`before_despill`, `before_help`
+    draw into `outer`)."""
     panel, words, operators = ck("panel"), ck("words"), ck("operators")
+    layout = engine_column(outer, src)
     needed = ("_line", "_section", "_draw_controls", "_draw_time_awareness", "_draw_alpha_hint",
               "_draw_output", "_draw_despill", "_draw_help")
     if not all(hasattr(panel, n) for n in needed):  # a newer Corridor add-on: its own panel, whole
         panel.draw_controls(layout, src)
+        for hook in (before_despill, before_help):
+            if hook:
+                hook(outer)
         return
-    layout.use_property_split = True
-    layout.use_property_decorate = False
     state = panel.settings(src) if hasattr(panel, "settings") else st(src)
     if hasattr(operators, "status_line"):
         panel._line(layout, words.STATUS, operators.status_line(src, scene))
@@ -4393,6 +4412,7 @@ def draw_paid_controls(layout, src, scene) -> None:
         panel._line(layout, words.LICENSE, state.licence_line)
         layout.operator("corridorkey.manage_license", text=words.MANAGE_LICENSE)
         layout.separator()
+    hooks = {"despill": before_despill, "help": before_help}
     for key, title, draw, closed in (
         ("controls", words.SECTION_CONTROLS, panel._draw_controls, False),
         ("time_awareness", words.SECTION_TIME_AWARENESS, panel._draw_time_awareness, False),
@@ -4400,6 +4420,9 @@ def draw_paid_controls(layout, src, scene) -> None:
         ("despill", words.SECTION_DESPILL, panel._draw_despill, False),
         ("help", words.SECTION_HELP, panel._draw_help, True),
     ):
+        if hooks.get(key):
+            hooks[key](outer)
+            layout = engine_column(outer, src)  # Corridor's next sections go below ours
         body = panel._section(layout, key, title, closed=closed) if closed else panel._section(layout, key, title)
         if body:
             draw(body, src, state)
@@ -4904,11 +4927,11 @@ def draw_free_hint_settings(layout, src) -> None:
     row.prop(state, "carry_hint_quality")
 
 
-def draw_free_controls(layout, src) -> None:
+def draw_free_controls(outer, src, before_despill=None, before_help=None) -> None:
+    """The free engine's sections, with ours in between: the Alpha Hint above Output and Despill,
+    the Tips last (the free engine has no Help section)."""
     state = src.corridorkey2
-    uid = state.uid
-    layout.use_property_split = True
-    layout.use_property_decorate = False
+    layout = engine_column(outer, src)
     session = _FREE[0]
     if session is not None and session.alive() and session.gpu:
         layout.label(text=f"GPU: {session.gpu}", icon="MEMORY")
@@ -4927,12 +4950,17 @@ def draw_free_controls(layout, src) -> None:
         body.prop(state, "preview_context")
         body.prop(state, "low_vram")
 
+    if before_despill:
+        before_despill(outer)
+        layout = engine_column(outer, src)
     body = _section(layout, "output", "Output and Despill")
     if body:
         body.prop(state, "output")
         row = body.row()
         row.enabled = state.output == "CUTOUT"
         row.prop(state, "despill_strength")
+    if before_help:
+        before_help(outer)
 
 
 FREE_CHECK: dict = {"line": "", "running": False}
