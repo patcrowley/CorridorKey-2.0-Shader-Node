@@ -16,7 +16,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 - **Previews:**
   - Preview Frame, plus **Live**, which keys each frame you stop on.
   - **Quick Preview** for speed.
-  - **Cache Ahead**, which keys frames outward from the playhead, like After Effects.
+  - **Cache Ahead**, which keys frames outward from the playhead while Live is on, like After Effects.
   - The model stays loaded between previews, so later frames take about a second.
 - **Timeline bars:** blue for the rendered key (it grows frame by frame while a render runs), green for previews, orange for frames being keyed.
 
@@ -42,7 +42,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 ## Install
 
-1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.11.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
+1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.12.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
 2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 

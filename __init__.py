@@ -2172,7 +2172,8 @@ def tick() -> float:
                             place_footage(image_node, scene)
                     if node.corridorkey_shader.live_preview and not playing and not HINT_JOBS:
                         changed |= live_step(src, scene)
-                    if node.corridorkey_shader.cache_ahead and not playing and not HINT_JOBS and engine_available():
+                    if (node.corridorkey_shader.cache_ahead and node.corridorkey_shader.live_preview
+                            and not playing and not HINT_JOBS and engine_available()):
                         changed |= cache_step(node, src, scene)
                 changed |= sync(node, src, scene)
             marks = timeline_marks(scene)
@@ -2435,8 +2436,8 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     cache_ahead: bpy.props.BoolProperty(
         name="Cache Ahead", default=False,
         description=(
-            "While the playhead rests, keep previewing the frames around it, nearest first and "
-            "outwards, like After Effects' background caching (green on the timeline)"
+            "With Live on: while the playhead rests, keep previewing the frames around it, "
+            "nearest first and outwards, like After Effects' background caching (green on the timeline)"
         ),
     )
     cache_radius: bpy.props.IntProperty(
@@ -2502,7 +2503,8 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
                     "times the screen key. Renders, and locks for a render farm, the same way",
         default=False, update=lambda self, _c: setattr(self, "ui_screen", True) if self.screen_clean else None,
     )
-    ui_inputs: bpy.props.BoolProperty(name="Footage and Alpha Hint", default=True)
+    ui_inputs: bpy.props.BoolProperty(name="Footage", default=True)
+    ui_hint: bpy.props.BoolProperty(name="Alpha Hint", default=True)
     ui_sam3: bpy.props.BoolProperty(name="Alpha Hint Maker (SAM 3)", default=False)
     ui_screen: bpy.props.BoolProperty(name="Screen Key", default=False)
     ui_preview: bpy.props.BoolProperty(name="Preview", default=True)
@@ -3086,30 +3088,18 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     draw_getting_started(layout, node, src, context, in_shader_editor)
     draw_warnings(layout, src, context.scene)
 
-    inputs = _fold(layout, node.corridorkey_shader, "ui_inputs", "Footage and Alpha Hint", "IMAGE_DATA")
-    for title, name, image_node in (
-        ("Footage", IMAGE_IN, footage),
-        ("Alpha Hint (optional)", HINT_IN, hint),
-    ):
-        inputs.label(text=title)
-        texture, plugged = upstream_texture(node, name)
-        if texture is not None:
-            shown = texture.image.name if texture.image is not None else "no image"
-            inputs.label(text=f"{shown} (plugged in)", icon="LINKED")
-        elif plugged:
-            inputs.label(text=f"Plug an Image Texture node into {name}", icon="ERROR")
-        else:
-            inputs.template_ID(image_node, "image", open="image.open")
+    scene = context.scene
+    draw_render(layout, node, src, scene)
+
+    inputs = _fold(layout, node.corridorkey_shader, "ui_inputs", "Footage", "IMAGE_DATA")
+    _draw_input(inputs, node, IMAGE_IN, footage)
     if in_shader_editor:
         inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
-    draw_hint_maker(layout, node, src)
-    draw_screen_key(layout, node, src)
 
-    scene = context.scene
     previewing = uid in PREVIEW_JOBS and not PREVIEW_JOBS[uid].get("dest")
     settings = node.corridorkey_shader
-    note = "keying" if previewing else ("live" if settings.live_preview else "") + (
-        (" + cache ahead" if settings.live_preview else "cache ahead") if settings.cache_ahead else "")
+    note = "keying" if previewing else (
+        ("live + cache ahead" if settings.cache_ahead else "live") if settings.live_preview else "")
     box = _fold(layout, settings, "ui_preview", "Preview", "HIDE_OFF", note)
     row = box.row(align=True)
     if previewing:
@@ -3121,9 +3111,10 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
         box.label(text=PREVIEW_LINE[uid])
     box.prop(node.corridorkey_shader, "quick_preview")
     row = box.row(align=True)
+    row.enabled = settings.live_preview  # caching works with Live
     row.prop(node.corridorkey_shader, "cache_ahead", toggle=True, icon="FF")
     sub = row.row(align=True)
-    sub.enabled = node.corridorkey_shader.cache_ahead
+    sub.enabled = settings.live_preview and settings.cache_ahead
     sub.prop(node.corridorkey_shader, "cache_radius", text="Radius")
     sub.prop(node.corridorkey_shader, "cache_batch", text="Batch")
     cached = len(cached_frames(src, scene))
@@ -3139,19 +3130,54 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
         box.label(text="Showing the preview for this frame", icon="INFO")
     box.label(text="Timeline: blue = key, green = preview")
     box.label(text=warm_status(), icon="CHECKMARK" if warm_alive() else "TIME")
-    draw_render(layout, node, src, scene)
     layout.operator(CORRIDORKEY_SHADER_OT_reset.bl_idname, icon="LOOP_BACK").uid = uid
     layout.separator()
 
     # The engine's own settings sections, drawn for the hidden compositor node (their Render
-    # section is in the Render box above). Its buttons act on the editor's active node, so the
-    # source is handed to them as that node.
+    # section is in the Render box above, their Alpha Hint section in ours below). Its buttons act
+    # on the editor's active node, so the source is handed to them as that node.
     body = layout.column()
+    body.context_pointer_set("active_node", src)
     if is_free_source(src):
         draw_free_controls(body, src)
-        return
-    body.context_pointer_set("active_node", src)
-    draw_paid_controls(body, src, scene)
+    else:
+        draw_paid_controls(body, src, scene)
+    draw_alpha_hint(layout, node, src, scene, hint)
+
+
+def _draw_input(layout, node, name: str, image_node) -> None:
+    """One of the node's inputs: the Image Texture plugged in, or the image picked here."""
+    texture, plugged = upstream_texture(node, name)
+    if texture is not None:
+        shown = texture.image.name if texture.image is not None else "no image"
+        layout.label(text=f"{shown} (plugged in)", icon="LINKED")
+    elif plugged:
+        layout.label(text=f"Plug an Image Texture node into {name}", icon="ERROR")
+    else:
+        layout.template_ID(image_node, "image", open="image.open")
+
+
+def draw_alpha_hint(layout, node, src, scene, hint) -> None:
+    """Everything about the Alpha Hint, at the bottom: the hint itself, the engine's hint
+    settings, and the two ways to make or improve one (SAM 3, the screen key)."""
+    settings = node.corridorkey_shader
+    texture, plugged = upstream_texture(node, HINT_IN)
+    image = texture.image if texture is not None else (hint.image if hint is not None and not plugged else None)
+    busy = ("SAM 3 running" if st(src).uid in HINT_JOBS else
+            "baking the screen key" if st(src).uid in SCREEN_JOBS else
+            "screen key on" if settings.screen_clean else "")
+    body = _fold(layout, settings, "ui_hint", "Alpha Hint", "MOD_MASK", busy or ("none" if image is None else ""))
+    _draw_input(body, node, HINT_IN, hint)
+    engine_settings = body.column()
+    engine_settings.use_property_split = True
+    engine_settings.use_property_decorate = False
+    engine_settings.context_pointer_set("active_node", src)
+    if is_free_source(src):
+        draw_free_hint_settings(engine_settings, src)
+    else:
+        draw_paid_hint_settings(engine_settings, src)
+    draw_hint_maker(body, node, src)
+    draw_screen_key(body, node, src)
 
 
 class CORRIDORKEY_SHADER_PT_node(bpy.types.Panel):
@@ -4004,6 +4030,8 @@ class _Folded:
 def _fold(layout, settings, prop: str, title: str, icon: str, note: str = ""):
     """A section that folds away (its open state saved on the node): the layout to draw into, or
     a stand-in that draws nothing while it's closed. `note` shows in the header, open or closed."""
+    if isinstance(layout, _Folded):  # inside a folded section: nothing to draw
+        return layout
     header, body = layout.panel_prop(settings, prop)
     header.label(text=f"{title}: {note}" if note else title, icon=icon)
     return body if body is not None else _Folded()
@@ -4338,6 +4366,14 @@ def draw_render(layout, node, src, scene) -> None:
         farm.operator(CORRIDORKEY_SHADER_OT_lock.bl_idname, text=f"Lock All {others}", icon="LOCKED").every = True
 
 
+def draw_paid_hint_settings(layout, src) -> None:
+    """Corridor's Alpha Hint settings, as its own panel draws them."""
+    panel = ck("panel")
+    if hasattr(panel, "_draw_alpha_hint"):
+        state = panel.settings(src) if hasattr(panel, "settings") else st(src)
+        panel._draw_alpha_hint(layout, src, state)
+
+
 def draw_paid_controls(layout, src, scene) -> None:
     """Corridor's sections for the node, as its own panel draws them, less its Render section
     (which is in the Render box)."""
@@ -4360,7 +4396,6 @@ def draw_paid_controls(layout, src, scene) -> None:
     for key, title, draw, closed in (
         ("controls", words.SECTION_CONTROLS, panel._draw_controls, False),
         ("time_awareness", words.SECTION_TIME_AWARENESS, panel._draw_time_awareness, False),
-        ("alpha_hint", words.SECTION_ALPHA_HINT, panel._draw_alpha_hint, False),
         ("output", words.SECTION_OUTPUT, panel._draw_output, False),
         ("despill", words.SECTION_DESPILL, panel._draw_despill, False),
         ("help", words.SECTION_HELP, panel._draw_help, True),
@@ -4855,6 +4890,20 @@ def _section(layout, key: str, title: str, closed: bool = False):
     return body
 
 
+def draw_free_hint_settings(layout, src) -> None:
+    """The free engine's Alpha Hint settings."""
+    state = src.corridorkey2
+    layout.prop(state, "use_alpha_hint")
+    column = layout.column()
+    column.enabled = state.use_alpha_hint
+    column.prop(state, "hint_frames")
+    column.prop(state, "hint_quality")
+    column.prop(state, "carry_hint")
+    row = column.row()
+    row.enabled = state.carry_hint
+    row.prop(state, "carry_hint_quality")
+
+
 def draw_free_controls(layout, src) -> None:
     state = src.corridorkey2
     uid = state.uid
@@ -4877,18 +4926,6 @@ def draw_free_controls(layout, src) -> None:
         row.prop(state, "window")
         body.prop(state, "preview_context")
         body.prop(state, "low_vram")
-
-    body = _section(layout, "hint", "Alpha Hint")
-    if body:
-        body.prop(state, "use_alpha_hint")
-        column = body.column()
-        column.enabled = state.use_alpha_hint
-        column.prop(state, "hint_frames")
-        column.prop(state, "hint_quality")
-        column.prop(state, "carry_hint")
-        row = column.row()
-        row.enabled = state.carry_hint
-        row.prop(state, "carry_hint_quality")
 
     body = _section(layout, "output", "Output and Despill")
     if body:
