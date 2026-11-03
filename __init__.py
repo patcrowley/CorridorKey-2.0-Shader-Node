@@ -3090,13 +3090,6 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     draw_warnings(layout, src, context.scene)
 
     scene = context.scene
-    draw_render(layout, node, src, scene)
-
-    inputs = _fold(layout, node.corridorkey_shader, "ui_inputs", "Footage", "IMAGE_DATA")
-    _draw_input(inputs, node, IMAGE_IN, footage)
-    if in_shader_editor:
-        inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
-
     previewing = uid in PREVIEW_JOBS and not PREVIEW_JOBS[uid].get("dest")
     settings = node.corridorkey_shader
     note = "keying" if previewing else (
@@ -3123,6 +3116,14 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
         row = box.row()
         row.label(text=f"{cached} frame{'s' if cached != 1 else ''} cached for these settings")
         row.operator(CORRIDORKEY_SHADER_OT_clear_previews.bl_idname, text="", icon="TRASH").uid = uid
+
+    draw_render(layout, node, src, scene)
+
+    inputs = _fold(layout, node.corridorkey_shader, "ui_inputs", "Footage", "IMAGE_DATA")
+    _draw_input(inputs, node, IMAGE_IN, footage)
+    if in_shader_editor:
+        inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
+
     layout.operator(CORRIDORKEY_SHADER_OT_reset.bl_idname, icon="LOOP_BACK").uid = uid
     layout.separator()
 
