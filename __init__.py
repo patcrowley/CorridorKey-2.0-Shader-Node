@@ -482,9 +482,33 @@ def wire(tree: bpy.types.NodeTree, mode: str, screen=None) -> bool:
 
 # --- the screen key: a simple green/blue keyer, live in the node, or baked into the Alpha Hint ------
 
-SK_PLATE, SK_GAMMA, SK_SPLIT = "CK Screen Footage", "CK Screen Gamma", "CK Screen Channels"
-SK_MAX, SK_DIFF, SK_MAP, SK_MULT = "CK Screen Others", "CK Screen Difference", "CK Screen Matte", "CK Screen Clean"
+SK_PLATE, SK_GAMMA, SK_SCORE = "CK Screen Footage", "CK Screen Gamma", "CK Screen Score"
+SK_MAP, SK_MULT = "CK Screen Matte", "CK Screen Clean"
 SK_GAMMA_VALUE = 1 / 2.2  # display-like values, as screen_key_worker.py judges them
+SCREEN_GREEN, SCREEN_BLUE = (0.20, 0.62, 0.25), (0.15, 0.25, 0.65)  # typical screens, display-like
+
+
+def _display(color) -> tuple[float, float, float]:
+    return tuple(max(float(c), 0.0) ** SK_GAMMA_VALUE for c in color[:3])
+
+
+def _linear(color) -> tuple[float, float, float]:
+    return tuple(float(c) ** (1 / SK_GAMMA_VALUE) for c in color[:3])
+
+
+def screen_direction(settings) -> tuple[float, float, float]:
+    """The picked screen colour's hue as a unit vector (its display-like colour minus its grey
+    level): a pixel's lean towards it is its dot product with this. Grey picks key green."""
+    colour = _display(settings.screen_pick)
+    mean = sum(colour) / 3
+    chroma = [c - mean for c in colour]
+    length = sum(c * c for c in chroma) ** 0.5
+    if length < 0.02:
+        colour = SCREEN_GREEN
+        mean = sum(colour) / 3
+        chroma = [c - mean for c in colour]
+        length = sum(c * c for c in chroma) ** 0.5
+    return tuple(c / length for c in chroma)
 
 
 def _value_input(node, name: str):
@@ -492,10 +516,12 @@ def _value_input(node, name: str):
 
 
 def ensure_screen_nodes(tree) -> bool:
-    """The keyer inside the shader group (made once): the footage, in display-like values, split
-    into channels; screen colour minus the larger other channel; a smoothstep from kept to out."""
-    if tree.nodes.get(SK_MULT) is not None:
+    """The keyer inside the shader group (made once): the footage in display-like values, its
+    dot product with the screen colour's direction, a smoothstep from kept to taken out."""
+    if tree.nodes.get(SK_MULT) is not None and tree.nodes.get(SK_SCORE) is not None:
         return False
+    for old in [n for n in tree.nodes if n.name.startswith("CK Screen")]:  # v2.10's green/blue graph
+        tree.nodes.remove(old)
     nodes, links = tree.nodes, tree.links
     coords = next((n for n in nodes if n.bl_idname == "ShaderNodeTexCoord"), None) or nodes.new("ShaderNodeTexCoord")
     plate = nodes.new("ShaderNodeTexImage")
@@ -508,27 +534,20 @@ def ensure_screen_nodes(tree) -> bool:
     gamma.inputs["Gamma"].default_value = SK_GAMMA_VALUE
     gamma.location = (60, -420)
     links.new(plate.outputs["Color"], gamma.inputs["Color"])
-    split = nodes.new("ShaderNodeSeparateColor")
-    split.name = SK_SPLIT
-    split.location = (240, -420)
-    links.new(gamma.outputs["Color"], split.inputs["Color"])
-    others = nodes.new("ShaderNodeMath")
-    others.name, others.operation = SK_MAX, "MAXIMUM"
-    others.location = (420, -360)
-    difference = nodes.new("ShaderNodeMath")
-    difference.name, difference.operation = SK_DIFF, "SUBTRACT"
-    difference.location = (600, -420)
-    links.new(others.outputs[0], difference.inputs[1])
+    score = nodes.new("ShaderNodeVectorMath")
+    score.name, score.operation = SK_SCORE, "DOT_PRODUCT"
+    score.location = (260, -420)
+    links.new(gamma.outputs["Color"], score.inputs[0])
     matte = nodes.new("ShaderNodeMapRange")
     matte.name, matte.data_type, matte.interpolation_type = SK_MAP, "FLOAT", "SMOOTHSTEP"
     matte.clamp = True
-    matte.location = (780, -420)
-    links.new(difference.outputs[0], _value_input(matte, "Value"))
+    matte.location = (460, -420)
+    links.new(score.outputs["Value"], _value_input(matte, "Value"))
     _value_input(matte, "To Min").default_value = 1.0  # not screen: kept
     _value_input(matte, "To Max").default_value = 0.0  # screen: taken out
     multiply = nodes.new("ShaderNodeMath")
     multiply.name, multiply.operation = SK_MULT, "MULTIPLY"
-    multiply.location = (960, -300)
+    multiply.location = (660, -300)
     return True
 
 
@@ -546,12 +565,11 @@ def screen_update(tree, settings, plate) -> bool:
             changed |= _set(user, attr, getattr(plate, attr))
         changed |= _set(user, "use_auto_refresh", True)
         changed |= _set(user, "use_cyclic", False)
-    split, others, difference = nodes[SK_SPLIT], nodes[SK_MAX], nodes[SK_DIFF]
-    screen, first, second = (("Green", "Red", "Blue") if settings.screen_color == "GREEN"
-                             else ("Blue", "Red", "Green"))
-    changed |= _link(tree, split.outputs[screen], difference.inputs[0])
-    changed |= _link(tree, split.outputs[first], others.inputs[0])
-    changed |= _link(tree, split.outputs[second], others.inputs[1])
+    direction = nodes[SK_SCORE].inputs[1]
+    wanted = screen_direction(settings)
+    if any(abs(a - b) > 1e-5 for a, b in zip(direction.default_value, wanted)):
+        direction.default_value = wanted
+        changed = True
     matte = nodes[SK_MAP]
     changed |= _set(_value_input(matte, "From Min"), "default_value", settings.screen_threshold)
     changed |= _set(_value_input(matte, "From Max"), "default_value",
@@ -2463,10 +2481,11 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
         name="Confidence", default=0.5, min=0.05, max=0.95,
         description="How sure SAM 3 must be: lower finds more, higher finds less",
     )
-    screen_color: bpy.props.EnumProperty(
-        name="Screen",
-        items=[("GREEN", "Green", "Key out a green screen"), ("BLUE", "Blue", "Key out a blue screen")],
-        default="GREEN",
+    screen_pick: bpy.props.FloatVectorProperty(
+        name="Screen Colour", subtype="COLOR", size=3, min=0.0, soft_max=1.0,
+        default=(0.033, 0.343, 0.051),  # a typical green screen (Green fills it in again)
+        description="The screen's colour: click it and use the eyedropper on the screen in your "
+                    "footage, or pick Green or Blue",
     )
     screen_threshold: bpy.props.FloatProperty(
         name="Threshold", default=0.04, min=0.0, max=0.5, step=0.5, precision=3,
@@ -2481,8 +2500,13 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
         name="Clean the Key",
         description="Take the screen colour out of the key live, inside this node: the key's alpha "
                     "times the screen key. Renders, and locks for a render farm, the same way",
-        default=False,
+        default=False, update=lambda self, _c: setattr(self, "ui_screen", True) if self.screen_clean else None,
     )
+    ui_inputs: bpy.props.BoolProperty(name="Footage and Alpha Hint", default=True)
+    ui_sam3: bpy.props.BoolProperty(name="Alpha Hint Maker (SAM 3)", default=False)
+    ui_screen: bpy.props.BoolProperty(name="Screen Key", default=False)
+    ui_preview: bpy.props.BoolProperty(name="Preview", default=True)
+    ui_render: bpy.props.BoolProperty(name="Render", default=True)
     screen_show: bpy.props.BoolProperty(
         name="Show Matte",
         description="Show the screen key itself (white kept, black taken out) while you tune it",
@@ -3062,29 +3086,32 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     draw_getting_started(layout, node, src, context, in_shader_editor)
     draw_warnings(layout, src, context.scene)
 
+    inputs = _fold(layout, node.corridorkey_shader, "ui_inputs", "Footage and Alpha Hint", "IMAGE_DATA")
     for title, name, image_node in (
         ("Footage", IMAGE_IN, footage),
         ("Alpha Hint (optional)", HINT_IN, hint),
     ):
-        layout.label(text=title)
+        inputs.label(text=title)
         texture, plugged = upstream_texture(node, name)
         if texture is not None:
             shown = texture.image.name if texture.image is not None else "no image"
-            layout.label(text=f"{shown} (plugged in)", icon="LINKED")
+            inputs.label(text=f"{shown} (plugged in)", icon="LINKED")
         elif plugged:
-            layout.label(text=f"Plug an Image Texture node into {name}", icon="ERROR")
+            inputs.label(text=f"Plug an Image Texture node into {name}", icon="ERROR")
         else:
-            layout.template_ID(image_node, "image", open="image.open")
+            inputs.template_ID(image_node, "image", open="image.open")
     if in_shader_editor:
-        layout.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
+        inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
     draw_hint_maker(layout, node, src)
     draw_screen_key(layout, node, src)
 
-    box = layout.box()
-    box.label(text="Preview", icon="HIDE_OFF")
-    row = box.row(align=True)
     scene = context.scene
     previewing = uid in PREVIEW_JOBS and not PREVIEW_JOBS[uid].get("dest")
+    settings = node.corridorkey_shader
+    note = "keying" if previewing else ("live" if settings.live_preview else "") + (
+        (" + cache ahead" if settings.live_preview else "cache ahead") if settings.cache_ahead else "")
+    box = _fold(layout, settings, "ui_preview", "Preview", "HIDE_OFF", note)
+    row = box.row(align=True)
     if previewing:
         row.operator(CORRIDORKEY_SHADER_OT_cancel_preview.bl_idname, icon="CANCEL").uid = uid
     else:
@@ -3882,7 +3909,7 @@ def start_screen_hint(node, scene) -> str | None:
     for index in range(workers):
         request = {
             "frames": [[n, os.path.join(folder, plates[n]), hints[n]] for n in numbers],
-            "color": settings.screen_color, "threshold": settings.screen_threshold,
+            "direction": list(screen_direction(settings)), "threshold": settings.screen_threshold,
             "softness": settings.screen_softness, "out_dir": out_dir, "prefix": "hint_",
             "slice": [index, workers],
         }
@@ -3904,7 +3931,7 @@ def start_screen_hint(node, scene) -> str | None:
     SCREEN_JOBS[uid] = {
         "processes": processes, "work": work, "out_dir": out_dir, "total": len(numbers),
         "node": node.name, "material": _owner_name(node), "base": base, "started": time.monotonic(),
-        "what": f"{settings.screen_color.lower()} screen key {with_hint}{note}",
+        "what": f"{screen_name(settings)} screen key {with_hint}{note}",
     }
     PREVIEW_LINE["screen:" + uid] = f"Baking the {SCREEN_JOBS[uid]['what']}..."
     return None
@@ -3964,11 +3991,60 @@ def land_screen_hints() -> bool:
     return changed
 
 
+class _Folded:
+    """What a closed section draws into: everything, quietly, nowhere."""
+
+    def __getattr__(self, _name):
+        return lambda *args, **kwargs: self
+
+    def __setattr__(self, _name, _value):
+        pass
+
+
+def _fold(layout, settings, prop: str, title: str, icon: str, note: str = ""):
+    """A section that folds away (its open state saved on the node): the layout to draw into, or
+    a stand-in that draws nothing while it's closed. `note` shows in the header, open or closed."""
+    header, body = layout.panel_prop(settings, prop)
+    header.label(text=f"{title}: {note}" if note else title, icon=icon)
+    return body if body is not None else _Folded()
+
+
+def screen_name(settings) -> str:
+    """The picked screen colour in words: green, blue, or its hex value."""
+    colour = _display(settings.screen_pick)
+    for name, preset in (("green", SCREEN_GREEN), ("blue", SCREEN_BLUE)):
+        if all(abs(a - b) < 0.02 for a, b in zip(colour, preset)):
+            return name
+    return "#" + "".join(f"{round(min(c, 1.0) * 255):02x}" for c in colour)
+
+
+class CORRIDORKEY_SHADER_OT_screen_preset(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.screen_preset"
+    bl_label = "Screen Preset"
+    bl_description = "Set the screen colour to a typical green or blue screen"
+    bl_options = {"REGISTER", "UNDO"}
+
+    colour: bpy.props.EnumProperty(items=[("GREEN", "Green", ""), ("BLUE", "Blue", "")], options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        node = node_by_source(self.uid)
+        if node is None:
+            return {"CANCELLED"}
+        node.corridorkey_shader.screen_pick = _linear(SCREEN_GREEN if self.colour == "GREEN" else SCREEN_BLUE)
+        return {"FINISHED"}
+
+
 def draw_screen_key(layout, node, src) -> None:
     uid, settings = st(src).uid, node.corridorkey_shader
-    box = layout.box()
-    box.label(text="Screen Key (green/blue)", icon="IMAGE_ALPHA")
-    box.row().prop(settings, "screen_color", expand=True)
+    note = ("baking" if uid in SCREEN_JOBS else
+            f"cleaning ({screen_name(settings)})" if settings.screen_clean else
+            "showing the matte" if settings.screen_show else "")
+    box = _fold(layout, settings, "ui_screen", "Screen Key", "IMAGE_ALPHA", note)
+    row = box.row(align=True)
+    row.prop(settings, "screen_pick", text="")
+    for colour, text in (("GREEN", "Green"), ("BLUE", "Blue")):
+        op = row.operator(CORRIDORKEY_SHADER_OT_screen_preset.bl_idname, text=text)
+        op.uid, op.colour = uid, colour
     row = box.row(align=True)
     row.prop(settings, "screen_threshold")
     row.prop(settings, "screen_softness")
@@ -4154,8 +4230,10 @@ class CORRIDORKEY_SHADER_OT_sam3_install(bpy.types.Operator):
 def draw_hint_maker(layout, node, src) -> None:
     uid = st(src).uid
     settings = node.corridorkey_shader
-    box = layout.box()
-    box.label(text="Alpha Hint Maker (SAM 3)", icon="MOD_MASK")
+    job = HINT_JOBS.get(uid)
+    box = _fold(layout, settings, "ui_sam3", "Alpha Hint Maker (SAM 3)", "MOD_MASK",
+                f"{job['done']} of {job['total']}" if job and job.get("total") and job.get("done") else
+                ("running" if job else ""))
     problem = sam3_problem()
     if problem:
         box.label(text=problem, icon="ERROR")
@@ -4187,12 +4265,11 @@ def draw_render(layout, node, src, scene) -> None:
     goes, and locking it for a render farm."""
     uid, state, settings = st(src).uid, st(src), node.corridorkey_shader
     free = is_free_source(src)
-    box = layout.box()
-    box.context_pointer_set("active_node", src)  # Corridor's buttons act on the active node
-    box.label(text="Render", icon="RENDER_ANIMATION")
-
     range_job = PREVIEW_JOBS.get(uid) if (PREVIEW_JOBS.get(uid) or {}).get("dest") else None
     shot_job = uid in FREE_RENDERS if free else uid in set(getattr(ck("operators"), "JOBS", None) or ())
+    box = _fold(layout, settings, "ui_render", "Render", "RENDER_ANIMATION",
+                "rendering" if (range_job or shot_job) else "")
+    box.context_pointer_set("active_node", src)  # Corridor's buttons act on the active node
     line = PREVIEW_LINE.get(uid) if uid in RANGE_LINES else state.render_line
     if line:
         _lines(box, line, "BLANK1" if not (range_job or shot_job) else "TIME", 34)
@@ -5025,6 +5102,7 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_make_hint,
     CORRIDORKEY_SHADER_OT_cancel_hint,
     CORRIDORKEY_SHADER_OT_screen_hint,
+    CORRIDORKEY_SHADER_OT_screen_preset,
     CORRIDORKEY_SHADER_OT_cancel_screen_hint,
     CORRIDORKEY_SHADER_OT_sam3_check,
     CORRIDORKEY_SHADER_OT_sam3_install,

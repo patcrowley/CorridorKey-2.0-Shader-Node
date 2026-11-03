@@ -11,7 +11,7 @@ is one), and writes a white-on-black PNG named after the plate number. A frame t
 written is skipped, so several workers can share one request (each takes every Nth frame).
 
     {"frames": [[1001, "C:/.../plate_01001.png", "C:/.../hint_01001.png"], ...],
-     "color": "GREEN" | "BLUE", "threshold": 0.04, "softness": 0.08,
+     "direction": [x, y, z] (screen_direction of the picked colour), "threshold": 0.04, "softness": 0.08,
      "out_dir": "...", "prefix": "hint_", "slice": [0, 4]}
 """
 
@@ -38,14 +38,29 @@ def to_display(linear: np.ndarray) -> np.ndarray:
     return np.clip(linear, 0.0, None) ** (1.0 / GAMMA)
 
 
-def screen_matte(rgb: np.ndarray, color: str, threshold: float, softness: float) -> np.ndarray:
-    """1 where the footage is not the screen, 0 where it is: the colour difference (green minus
-    the larger of red and blue, or blue minus red/green, in display-like values) through a
-    smoothstep from `threshold` to `threshold + softness`. The same sums as the live keyer inside
-    the shader node."""
-    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
-    difference = g - np.maximum(r, b) if color == "GREEN" else b - np.maximum(r, g)
-    t = np.clip((difference - threshold) / max(softness, 1e-6), 0.0, 1.0)
+GREEN, BLUE = (0.20, 0.62, 0.25), (0.15, 0.25, 0.65)  # typical screens, display-like values
+
+
+def screen_direction(display_color) -> np.ndarray:
+    """The screen colour's hue as a unit vector: the colour minus its grey level, normalised.
+    A pixel's score is its dot product with this: how far it leans towards the screen colour
+    (grey and white score 0, skin and other opposite colours score below 0)."""
+    colour = np.asarray(display_color, dtype=np.float64)
+    chroma = colour - colour.mean()
+    length = float(np.linalg.norm(chroma))
+    if length < 0.02:  # a grey pick has no hue to key: green
+        return screen_direction(GREEN)
+    return chroma / length
+
+
+def screen_matte(rgb: np.ndarray, direction, threshold: float, softness: float) -> np.ndarray:
+    """1 where the footage is not the screen, 0 where it is: each pixel's lean towards the screen
+    colour (display-like values) through a smoothstep from `threshold` to `threshold + softness`.
+    The same sums as the live keyer inside the shader node. `direction` may be "GREEN"/"BLUE"."""
+    if isinstance(direction, str):
+        direction = screen_direction(BLUE if direction == "BLUE" else GREEN)
+    score = rgb[..., :3] @ np.asarray(direction, dtype=rgb.dtype)
+    t = np.clip((score - threshold) / max(softness, 1e-6), 0.0, 1.0)
     return 1.0 - t * t * (3.0 - 2.0 * t)
 
 
@@ -85,7 +100,7 @@ def write_grey_png(path: str, matte_bottom_up: np.ndarray) -> None:
 
 
 def _pixels(path: str):
-    """(H x W x 4 float array, bottom row first, whether it was 8-bit sRGB) via Blender."""
+    """(H x W x 4 float array, bottom row first, whether it's display-encoded) via Blender."""
     import bpy
 
     image = bpy.data.images.load(path, check_existing=False)
@@ -93,8 +108,10 @@ def _pixels(path: str):
         width, height = image.size
         flat = np.empty(width * height * 4, dtype=np.float32)
         image.pixels.foreach_get(flat)
-        srgb = not image.is_float and "srgb" in image.colorspace_settings.name.lower()
-        return flat.reshape(height, width, 4), srgb
+        # 8-bit images hold display-encoded values already, whatever Blender tags them (a PNG
+        # loads as "sRGB" or "Rec.1886" depending on the setup); float images (EXR) are linear
+        display = not image.is_float
+        return flat.reshape(height, width, 4), display
     finally:
         bpy.data.images.remove(image)
 
@@ -103,7 +120,7 @@ def main() -> None:
     request_path = sys.argv[sys.argv.index("--") + 1]
     with open(request_path, encoding="utf-8") as f:
         request = json.load(f)
-    color = request.get("color", "GREEN")
+    direction = request.get("direction") or request.get("color", "GREEN")
     threshold = float(request.get("threshold", 0.04))
     softness = float(request.get("softness", 0.08))
     out_dir, prefix = request["out_dir"], request.get("prefix", "hint_")
@@ -117,7 +134,7 @@ def main() -> None:
                 continue
             rgba, srgb = _pixels(footage)
             rgb = rgba[..., :3] if srgb else to_display(rgba[..., :3])  # 8-bit sRGB already is
-            matte = screen_matte(rgb, color, threshold, softness)
+            matte = screen_matte(rgb, direction, threshold, softness)
             if hint:
                 if hint not in hints:
                     value = hint_value(_pixels(hint)[0])
