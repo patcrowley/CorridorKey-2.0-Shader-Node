@@ -31,6 +31,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 - **Lock for Render Farm:** freezes the finished key into plain Blender nodes, so the material renders the same on machines without the add-on (SheepIt, farms, other computers). Unlock hands it back.
 - **SAM 3 alpha hints:** type what to keep (for example `person`) and make a matte for one frame or the whole shot. SAM 3 runs only when needed: it gets the GPU while it runs and frees it when it's done.
 - **Screen Key:** a simple keyer for screen that CorridorKey leaves behind. Pick the screen's colour with the eyedropper, or use the Green or Blue preset. **Clean the Key** multiplies the key's alpha by it live, inside the node. **Bake into Alpha Hint** multiplies it into your hint for every frame, so CorridorKey itself treats that screen as background. Tune it with **Show Matte**.
+- **Floor Shadows:** keeps the actor's real shadows on the floor. A see-through plane on the floor sees the footage through the camera, so it follows the camera by itself. Where the floor is shadowed, the plane darkens the CG behind it. **Bake Clean Floor** takes the lighting's falloff out first, so only real shadows darken.
 - **Two engines:**
   - **Corridor Add-on (paid):** Corridor Digital's CorridorKey add-on for Blender.
   - **Free (GitHub):** [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0), with a one-click installer (Windows, NVIDIA GPU).
@@ -43,7 +44,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 ## Install
 
-1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.15.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
+1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.16.0.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
 2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 

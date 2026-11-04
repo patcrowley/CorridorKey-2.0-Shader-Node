@@ -96,6 +96,45 @@ def write_grey_png(path: str, matte_bottom_up: np.ndarray) -> None:
     os.replace(path + ".part", path)  # only whole frames ever appear under their name
 
 
+def clean_floor(linear: np.ndarray, shown: np.ndarray, colour, direction, degree: int = 3,
+                columns: int = 160) -> np.ndarray:
+    """How bright the floor is where nothing shades it, as a multiple of the floor colour, over a
+    coarse grid (`columns` wide). Each block's floor brightness (its screen-hued pixels' share of
+    the floor colour) is fitted with a smooth surface (a polynomial of `degree` in x and y), again
+    and again without the blocks well below it: shadows are dips the fit learns to ignore, the
+    lighting's falloff is what it keeps. Rows run as the input's."""
+    colour = np.asarray(colour, dtype=np.float64)
+    height, width = linear.shape[:2]
+    block = max(1, width // columns)
+    rows, cols = height // block, width // block
+    linear = linear[: rows * block, : cols * block, :3]
+    shown = shown[: rows * block, : cols * block, :3]
+    share = (linear @ colour) / max(float(colour @ colour), 1e-9)
+    floor = (shown @ np.asarray(direction, dtype=np.float64)) > 0.06
+    total = np.where(floor, share, 0.0).reshape(rows, block, cols, block).sum(axis=(1, 3))
+    count = floor.reshape(rows, block, cols, block).sum(axis=(1, 3))
+    known = count > block * block * 0.5
+    level = total / np.maximum(count, 1)
+    ys, xs = np.mgrid[0:rows, 0:cols]
+    u, v = (xs + 0.5) / cols * 2 - 1, (ys + 0.5) / rows * 2 - 1
+    terms = [u ** i * v ** j for i in range(degree + 1) for j in range(degree + 1 - i)]
+    basis = np.stack([t.ravel() for t in terms], axis=1)
+    flat, keep = level.ravel(), known.ravel().copy()
+    if keep.sum() < len(terms) * 4:  # too little floor to fit: the floor colour itself
+        return np.ones((rows, cols))
+    fit = np.full(flat.shape, float(np.median(flat[keep])))
+    for _round in range(6):
+        coeffs, *_ = np.linalg.lstsq(basis[keep], flat[keep], rcond=None)
+        fit = basis @ coeffs
+        keep = known.ravel() & (flat > fit * 0.93)  # shadow blocks drop out of the next fit
+        if keep.sum() < len(terms) * 4:
+            break
+    # the floor's own variation sits about the fit: lift it to the unshadowed blocks' upper side
+    ratio = flat[keep] / np.maximum(fit[keep], 1e-6)
+    fit *= float(np.percentile(ratio, 75)) if len(ratio) else 1.0
+    return np.clip(fit.reshape(rows, cols), 0.02, 2.0)
+
+
 # --- Blender: reading the images -------------------------------------------------------------------
 
 
@@ -126,6 +165,9 @@ def main() -> None:
     out_dir, prefix = request["out_dir"], request.get("prefix", "hint_")
     start, step = request.get("slice", [0, 1])
     os.makedirs(out_dir, exist_ok=True)
+    if request.get("mode") == "clean_floor":
+        clean_floor_frames(request, start, step)
+        return
     hints: dict[str, np.ndarray] = {}  # one still hint, read once
     try:
         for number, footage, hint in request["frames"][start::step]:
@@ -147,6 +189,31 @@ def main() -> None:
         with open(os.path.join(out_dir, f"error_{start}.txt"), "w", encoding="utf-8") as f:
             f.write(f"{type(exc).__name__}: {exc}")
         raise
+
+
+def clean_floor_frames(request: dict, start: int, step: int) -> None:
+    """The clean-floor bake: one small grey PNG per plate (value / 2: up to twice the floor colour)."""
+    out_dir, prefix = request["out_dir"], request.get("prefix", "clean_")
+    try:
+        for number, footage, _hint in request["frames"][start::step]:
+            target = os.path.join(out_dir, f"{prefix}{int(number):06d}.png")
+            if os.path.exists(target):
+                continue
+            rgba, display = _pixels(footage)
+            rgb = rgba[..., :3]
+            linear = _srgb_to_linear(rgb) if display else np.clip(rgb, 0.0, None)
+            shown = rgb if display else to_display(rgb)
+            level = clean_floor(linear, shown, request["colour"], request["direction"],
+                                int(request.get("degree", 3)), int(request.get("columns", 160)))
+            write_grey_png(target, level / 2.0)
+    except Exception as exc:  # the add-on shows this line
+        with open(os.path.join(out_dir, f"error_{start}.txt"), "w", encoding="utf-8") as f:
+            f.write(f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def _srgb_to_linear(values: np.ndarray) -> np.ndarray:
+    return np.where(values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4)
 
 
 if __name__ == "__main__":

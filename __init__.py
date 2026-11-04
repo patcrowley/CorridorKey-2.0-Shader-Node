@@ -2104,6 +2104,10 @@ def sync(
     screen_changed = False
     if settings.screen_clean or settings.screen_show:
         screen_changed = screen_update(node.node_tree, settings, wired_image_node(src, 0))
+    if settings.floor_name:
+        floor = bpy.data.objects.get(settings.floor_name)
+        if floor is not None and floor.get(FLOOR_TAG) == st(src).uid:
+            floor_sync(floor, wired_image_node(src, 0))
     if preview is not None:  # this frame has been previewed: show the cache, played as a sequence
         image = preview_image(src, *preview)
         plate = wired_image_node(src, 0)
@@ -2140,6 +2144,7 @@ def tick() -> float:
             changed |= land_paid_renders()
             changed |= land_hints()
             changed |= land_screen_hints()
+            changed |= land_floor_bakes()
             if getattr(ck_ops, "JOBS", None):  # a paid render takes the card: previews wait
                 for uid in list(PREVIEW_JOBS):
                     cancel_preview(uid)
@@ -2510,6 +2515,8 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     ui_preview: bpy.props.BoolProperty(name="Preview", default=True)
     ui_render: bpy.props.BoolProperty(name="Render", default=True)
     ui_tips: bpy.props.BoolProperty(name="Tips", default=True)
+    ui_floor: bpy.props.BoolProperty(name="Floor Shadows", default=True)
+    floor_name: bpy.props.StringProperty(options={"HIDDEN"})
     screen_show: bpy.props.BoolProperty(
         name="Show Matte",
         description="Show the screen key itself (white kept, black taken out) while you tune it",
@@ -3186,6 +3193,7 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     _draw_input(inputs, node, IMAGE_IN, footage)
     if in_shader_editor:
         inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
+    draw_floor_shadows(layout, node, src, scene)
     layout.separator()
 
     # The engine's own settings sections, drawn for the hidden compositor node (their Render
@@ -4382,6 +4390,727 @@ def draw_hint_maker(layout, node, src) -> None:
         _lines(box, line, "NONE", 40)
 
 
+# --- floor shadows: the real shadows on the floor, kept, on a plane at the floor ----------------
+#
+# A see-through plane lies on the floor (Z = 0, where Jetset puts it). Its material looks at the
+# footage through the camera (Window coordinates), so each point of the plane sees the plate pixel
+# in front of it, and it follows any camera move by itself: the plane is the floor mask. Where the
+# plate is darker than the clean floor colour, the plane darkens what's behind it by that much
+# (a Transparent BSDF tinted by the ratio: a true multiply), only where the plate is still the
+# screen's hue (so the actor, standing in front of it, is never darkened).
+
+FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK Floor Shadows"
+FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
+FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
+FLOOR_VERSION = 2
+FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
+FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
+FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
+
+
+def _feed(links, socket, value) -> None:
+    if isinstance(value, bpy.types.NodeSocket):
+        links.new(value, socket)
+    else:
+        socket.default_value = value
+
+
+def ensure_floor_group():
+    """The shadow maths as one node group (made once, remade when this add-on changes it)."""
+    tree = bpy.data.node_groups.get(FLOOR_GROUP)
+    if tree is not None and tree.get("ck_version") == FLOOR_VERSION:
+        return tree
+    kept = []  # the settings on the planes using an older version, put back after
+    if tree is None:
+        tree = bpy.data.node_groups.new(FLOOR_GROUP, "ShaderNodeTree")
+    else:
+        for material in bpy.data.materials:
+            for n in (material.node_tree.nodes if material.node_tree else ()):
+                if n.bl_idname == "ShaderNodeGroup" and n.node_tree == tree:
+                    kept.append((n, {i.name: tuple(i.default_value) if hasattr(i.default_value, "__len__")
+                                     else i.default_value for i in n.inputs if hasattr(i, "default_value")}))
+    tree.nodes.clear()
+    tree.interface.clear()
+    tree["ck_version"] = FLOOR_VERSION
+    face = tree.interface
+
+    def add(name, kind, default, low=None, high=None, about=""):
+        socket = face.new_socket(name, in_out="INPUT", socket_type=kind)
+        socket.default_value = default
+        if low is not None:
+            socket.min_value, socket.max_value = low, high
+        socket.description = about
+
+    add("Footage", "NodeSocketColor", (0.5, 0.5, 0.5, 1.0), about="The plate, seen through the camera")
+    add("Floor Colour", "NodeSocketColor", (0.05, 0.35, 0.06, 1.0),
+        about="The floor where nothing shades it: anything darker reads as shadow")
+    add("Density", "NodeSocketFloat", 1.0, 0.0, 2.0, "How dark the kept shadows are (1 = as shot)")
+    add("Lift", "NodeSocketFloat", 0.1, 0.0, 0.9,
+        "Ignore darkening weaker than this: uneven lighting and noise, not shadow")
+    add("Keep Colour", "NodeSocketFloat", 0.0, 0.0, 1.0,
+        "0: neutral shadows. 1: the shadows' own colour (can carry screen spill)")
+    add("Screen Gate", "NodeSocketFloat", 0.03, 0.0, 0.5,
+        "How much of the screen's hue a pixel needs to count as floor (keeps the actor clear)")
+    add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's edges (share of its size)")
+    add("Show Matte", "NodeSocketFloat", 0.0, 0.0, 1.0, "Show the shadow matte itself, white on black")
+    add("Clean Floor", "NodeSocketFloat", 0.5, 0.0, 1.0,
+        "The unshadowed floor's brightness here, half scale (0.5 = the Floor Colour): the baked clean floor")
+    face.new_socket("Shader", in_out="OUTPUT", socket_type="NodeSocketShader")
+
+    nodes, links = tree.nodes, tree.links
+    made = []
+
+    def node(kind, **attrs):
+        n = nodes.new(kind)
+        for key, value in attrs.items():
+            setattr(n, key, value)
+        made.append(n)
+        n.location = (200 * (len(made) % 12) - 1000, -180 * (len(made) // 12))
+        return n
+
+    def math(op, a, b=None, clamp=False):
+        n = node("ShaderNodeMath", operation=op, use_clamp=clamp)
+        _feed(links, n.inputs[0], a)
+        if b is not None:
+            _feed(links, n.inputs[1], b)
+        return n.outputs[0]
+
+    def vmath(op, a, b=None, scale=None):
+        n = node("ShaderNodeVectorMath", operation=op)
+        _feed(links, n.inputs[0], a)
+        if b is not None:
+            _feed(links, n.inputs[1], b)
+        if scale is not None:
+            _feed(links, n.inputs["Scale"], scale)
+        return n.outputs["Value" if op == "DOT_PRODUCT" else "Vector"]
+
+    def smooth(value, low, high):
+        n = node("ShaderNodeMapRange", data_type="FLOAT", interpolation_type="SMOOTHSTEP", clamp=True)
+        _feed(links, _value_input(n, "Value"), value)
+        _feed(links, _value_input(n, "From Min"), low)
+        _feed(links, _value_input(n, "From Max"), high)
+        return n.outputs["Result"]
+
+    def mix(factor, a, b, clamp=False):
+        n = node("ShaderNodeMix", data_type="RGBA", blend_type="MIX", clamp_result=clamp)
+        _feed(links, n.inputs["Factor"], factor)
+        colours = [s for s in n.inputs if s.type == "RGBA"]
+        _feed(links, colours[0], a)
+        _feed(links, colours[1], b)
+        return next(s for s in n.outputs if s.type == "RGBA")
+
+    def gamma(colour):
+        n = node("ShaderNodeGamma")
+        _feed(links, n.inputs["Color"], colour)
+        n.inputs["Gamma"].default_value = SK_GAMMA_VALUE
+        return n.outputs["Color"]
+
+    group_in = node("NodeGroupInput")
+    group_out = node("NodeGroupOutput")
+    plate, clean = group_in.outputs["Footage"], group_in.outputs["Floor Colour"]
+
+    # how much of the clean floor is there: 1 unshaded, 0 black; shadow is what's missing
+    level = math("MULTIPLY", group_in.outputs["Clean Floor"], 2.0)  # stored at half scale
+    there = math("DIVIDE", vmath("DOT_PRODUCT", plate, clean),
+                 math("MAXIMUM", math("MULTIPLY", vmath("DOT_PRODUCT", clean, clean), level), 1e-6), clamp=True)
+    shade = math("SUBTRACT", 1.0, there)
+    lift = group_in.outputs["Lift"]
+    shade = math("DIVIDE", math("SUBTRACT", shade, lift), math("MAXIMUM", math("SUBTRACT", 1.0, lift), 1e-3), clamp=True)
+    shade = math("MULTIPLY", shade, group_in.outputs["Density"], clamp=True)
+
+    # only where the plate still leans to the screen's hue (display-like values, as the screen key)
+    clean_d = gamma(clean)
+    mean = vmath("DOT_PRODUCT", clean_d, (1 / 3, 1 / 3, 1 / 3))
+    hue = vmath("NORMALIZE", vmath("SUBTRACT", clean_d, vmath("SCALE", (1.0, 1.0, 1.0), scale=mean)))
+    lean = vmath("DOT_PRODUCT", gamma(plate), hue)
+    gate_low = group_in.outputs["Screen Gate"]
+    floor = smooth(lean, gate_low, math("ADD", gate_low, 0.05))
+
+    # faded towards the plane's edges
+    coords = node("ShaderNodeTexCoord")
+    split = node("ShaderNodeSeparateXYZ")
+    links.new(coords.outputs["UV"], split.inputs[0])
+    u, v = split.outputs["X"], split.outputs["Y"]
+    inner = math("MINIMUM", math("MINIMUM", u, math("SUBTRACT", 1.0, u)),
+                 math("MINIMUM", v, math("SUBTRACT", 1.0, v)))
+    edge = smooth(inner, 0.0, math("MAXIMUM", group_in.outputs["Edge Feather"], 1e-4))
+
+    amount = math("MULTIPLY", math("MULTIPLY", shade, floor), edge, clamp=True)
+    ratio = mix(1.0, (0, 0, 0, 1), vmath("DIVIDE", plate, vmath("MAXIMUM", clean, (1e-4, 1e-4, 1e-4))), clamp=True)
+    tint = mix(group_in.outputs["Keep Colour"], (0, 0, 0, 1), ratio)
+    multiply = mix(amount, (1, 1, 1, 1), tint, clamp=True)
+
+    see_through = node("ShaderNodeBsdfTransparent")
+    links.new(multiply, see_through.inputs["Color"])
+    matte = node("ShaderNodeEmission")
+    links.new(amount, matte.inputs["Color"])
+    shader = node("ShaderNodeMixShader")
+    links.new(group_in.outputs["Show Matte"], shader.inputs[0])
+    links.new(see_through.outputs[0], shader.inputs[1])
+    links.new(matte.outputs[0], shader.inputs[2])
+    links.new(shader.outputs[0], group_out.inputs["Shader"])
+    for n, values in kept:
+        for name, value in values.items():
+            socket = n.inputs.get(name)
+            if socket is not None and hasattr(socket, "default_value"):
+                try:
+                    socket.default_value = value
+                except (TypeError, ValueError):
+                    pass
+    return tree
+
+
+def floor_object(node, src):
+    """This node's floor-shadow plane, or None."""
+    obj = bpy.data.objects.get(node.corridorkey_shader.floor_name) if node.corridorkey_shader.floor_name else None
+    return obj if obj is not None and obj.get(FLOOR_TAG) == st(src).uid else None
+
+
+def floor_group_node(obj):
+    material = obj.active_material if obj is not None else None
+    tree = material.node_tree if material is not None else None
+    return tree.nodes.get(FLOOR_NODE) if tree is not None else None
+
+
+def floor_sync(obj, plate) -> bool:
+    """The plane's footage: the node's plate, timed as it plays (and its clean floor with it)."""
+    material = obj.active_material
+    nodes = material.node_tree.nodes if material is not None and material.node_tree else None
+    texture = nodes.get(FLOOR_TEX) if nodes is not None else None
+    if texture is None or plate is None:
+        return False
+    changed = _set(texture, "image", plate.image)
+    clean = nodes.get(FLOOR_CLEAN)
+    for node in (texture, clean):
+        if node is not None and node.image is not None and plate.image is not None:
+            user = node.image_user
+            for attr in ("frame_start", "frame_offset", "frame_duration"):
+                changed |= _set(user, attr, getattr(plate, attr))
+            changed |= _set(user, "use_auto_refresh", True)
+            changed |= _set(user, "use_cyclic", False)
+    return changed
+
+
+def floor_footprint(scene):
+    """The four corners of the camera's view on the floor (Z = 0), the far ones reined in to
+    FLOOR_RANGE where the view runs to the horizon. None without a camera above the floor."""
+    camera = scene.camera
+    if camera is None or camera.type != "CAMERA":
+        return None
+    from mathutils import Vector
+
+    matrix = camera.matrix_world
+    origin = matrix.translation
+    if origin.z <= 0.01:
+        return None
+    corners = []
+    for local in camera.data.view_frame(scene=scene):
+        ray = (matrix @ local) - origin
+        flat = Vector((ray.x, ray.y, 0.0))
+        if ray.z < -1e-6:
+            point = origin + ray * (-origin.z / ray.z)
+            reach = (Vector((point.x, point.y, 0.0)) - Vector((origin.x, origin.y, 0.0))).length
+            if reach > FLOOR_RANGE and flat.length > 1e-6:
+                point = Vector((origin.x, origin.y, 0.0)) + flat.normalized() * FLOOR_RANGE
+        elif flat.length > 1e-6:
+            point = Vector((origin.x, origin.y, 0.0)) + flat.normalized() * FLOOR_RANGE
+        else:
+            return None
+        corners.append(Vector((point.x, point.y, FLOOR_LIFT)))
+    return corners
+
+
+def floor_mesh(mesh, corners) -> None:
+    """The plane's mesh: one quad through the corners, facing up, UVs 0-1 (for the edge fade)."""
+    import bmesh
+
+    a, b, c = corners[0], corners[1], corners[2]
+    if (b - a).cross(c - a).z < 0:  # face up
+        corners = list(reversed(corners))
+    bm = bmesh.new()
+    verts = [bm.verts.new(p) for p in corners]
+    face = bm.faces.new(verts)
+    uv = bm.loops.layers.uv.new("UVMap")
+    for loop, coord in zip(face.loops, ((0, 0), (1, 0), (1, 1), (0, 1))):
+        loop[uv].uv = coord
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+
+
+def _srgb_to_linear(values):
+    import numpy as np
+
+    return np.where(values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4)
+
+
+def sample_floor_colour(node, src, scene, obj):
+    """The clean floor's colour on the frame you're on: the brighter part (75th-95th percentile)
+    of the screen-coloured pixels the plane covers. (colour, None) or (None, why not)."""
+    import numpy as np
+    from bpy_extras.object_utils import world_to_camera_view
+
+    plate = wired_image_node(src, 0)
+    image = plate.image if plate is not None else None
+    if image is None or image.source not in {"SEQUENCE", "FILE"}:
+        return None, "Sampling needs footage as images (not a movie): pick the floor colour instead."
+    path = bpy.path.abspath(image.filepath, library=image.library)
+    if image.source == "SEQUENCE":
+        plates = numbered(os.path.dirname(path))
+        if not plates:
+            return None, "No footage frames found."
+        number = scene.frame_current - plate.frame_start + 1 + plate.frame_offset
+        nearest = min(plates, key=lambda n: abs(n - number))
+        path = os.path.join(os.path.dirname(path), plates[nearest])
+    loaded = bpy.data.images.load(path, check_existing=False)
+    try:
+        width, height = loaded.size
+        flat = np.empty(width * height * 4, dtype=np.float32)
+        loaded.pixels.foreach_get(flat)
+        display = not loaded.is_float
+    finally:
+        bpy.data.images.remove(loaded)
+    pixels = flat.reshape(height, width, 4)[..., :3]
+    step = max(1, width // 480)
+    pixels = pixels[::step, ::step]
+    rows, cols = pixels.shape[:2]
+    linear = _srgb_to_linear(pixels) if display else np.clip(pixels, 0.0, None)
+    shown = pixels if display else np.clip(pixels, 0.0, None) ** SK_GAMMA_VALUE
+
+    keep = np.ones((rows, cols), dtype=bool)
+    camera = scene.camera
+    if obj is not None and camera is not None:  # only what the plane covers
+        corners = [world_to_camera_view(scene, camera, obj.matrix_world @ v.co) for v in obj.data.vertices]
+        if len(corners) >= 3 and all(c.z > 0 for c in corners):
+            ys, xs = np.mgrid[0:rows, 0:cols]
+            px, py = (xs + 0.5) / cols, (ys + 0.5) / rows  # bottom-up, as Blender's rows run
+            sides = []
+            for i, c in enumerate(corners):
+                d = corners[(i + 1) % len(corners)]
+                sides.append((d.x - c.x) * (py - c.y) - (d.y - c.y) * (px - c.x))
+            keep = np.all(np.stack(sides) >= 0, axis=0) | np.all(np.stack(sides) <= 0, axis=0)
+    direction = np.asarray(screen_direction(node.corridorkey_shader), dtype=np.float32)
+    keep &= (shown @ direction) > 0.08  # the screen's hue: floor, not actor or set
+    found = linear[keep]
+    if len(found) < 200:
+        return None, "Too little screen floor in view here: try another frame, or pick the colour."
+    bright = found @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+    low, high = np.percentile(bright, [75, 95])
+    chosen = found[(bright >= low) & (bright <= high)]
+    colour = chosen.mean(axis=0) if len(chosen) else found.mean(axis=0)
+    return tuple(float(c) for c in colour), None
+
+
+def make_floor_shadows(node, src, scene):
+    """The plane, its material and its floor colour. (object, note) or (None, why not)."""
+    corners = floor_footprint(scene)
+    if corners is None:
+        return None, "Needs the scene camera above the floor (Z = 0)."
+    plate = wired_image_node(src, 0)
+    if plate is None or plate.image is None:
+        return None, "Connect the footage first."
+    owner = node.id_data
+    name = f"{FLOOR_GROUP} ({owner.name})" if owner is not None else FLOOR_GROUP
+    mesh = bpy.data.meshes.new(name)
+    floor_mesh(mesh, corners)
+    obj = bpy.data.objects.new(name, mesh)
+    obj[FLOOR_TAG] = st(src).uid
+    collection = scene.collection
+    for view_layer_obj in (bpy.context.active_object,):
+        if view_layer_obj is not None and view_layer_obj.users_collection:
+            collection = view_layer_obj.users_collection[0]
+    collection.objects.link(obj)
+    for attr in ("visible_shadow", "visible_diffuse", "visible_glossy", "visible_transmission",
+                 "visible_volume_scatter"):
+        if hasattr(obj, attr):
+            setattr(obj, attr, False)  # seen by the camera only: it lights and shades nothing
+
+    material = bpy.data.materials.new(name)
+    if hasattr(material, "use_nodes") and not material.use_nodes:
+        try:
+            material.use_nodes = True
+        except (AttributeError, TypeError):
+            pass
+    tree = material.node_tree
+    tree.nodes.clear()
+    out = tree.nodes.new("ShaderNodeOutputMaterial")
+    out.location = (400, 0)
+    coords = tree.nodes.new("ShaderNodeTexCoord")
+    coords.location = (-500, 0)
+    texture = tree.nodes.new("ShaderNodeTexImage")
+    texture.name = texture.label = FLOOR_TEX
+    texture.extension = "CLIP"
+    texture.location = (-300, 0)
+    tree.links.new(coords.outputs["Window"], texture.inputs["Vector"])
+    group = tree.nodes.new("ShaderNodeGroup")
+    group.node_tree = ensure_floor_group()
+    group.name = group.label = FLOOR_NODE
+    group.location = (0, 0)
+    tree.links.new(texture.outputs["Color"], group.inputs["Footage"])
+    tree.links.new(group.outputs["Shader"], out.inputs["Surface"])
+    clean = tree.nodes.new("ShaderNodeTexImage")
+    clean.name = clean.label = FLOOR_CLEAN
+    clean.extension, clean.interpolation = "EXTEND", "Linear"
+    clean.location = (-300, -300)
+    tree.links.new(coords.outputs["Window"], clean.inputs["Vector"])
+    if hasattr(material, "surface_render_method"):
+        material.surface_render_method = "BLENDED"  # EEVEE: a coloured see-through needs blending
+    elif hasattr(material, "blend_method"):
+        material.blend_method = "BLEND"
+    material.use_backface_culling = False
+    obj.data.materials.append(material)
+    node.corridorkey_shader.floor_name = obj.name
+    floor_sync(obj, plate)
+    colour, why = sample_floor_colour(node, src, scene, obj)
+    if colour is None:
+        group.inputs["Floor Colour"].default_value = (*_linear(_display(node.corridorkey_shader.screen_pick)), 1.0)
+        return obj, why + " Using the Screen Key colour for now."
+    group.inputs["Floor Colour"].default_value = (*colour, 1.0)
+    return obj, ""
+
+
+def _hue_of(colour_linear) -> list[float]:
+    """A colour's hue as a unit vector in display-like values (as screen_direction)."""
+    shown = _display(colour_linear)
+    mean = sum(shown) / 3
+    chroma = [c - mean for c in shown]
+    length = sum(c * c for c in chroma) ** 0.5
+    if length < 0.02:
+        return list(screen_direction(types.SimpleNamespace(screen_pick=_linear(SCREEN_GREEN))))
+    return [c / length for c in chroma]
+
+
+def start_floor_bake(node, src, scene) -> str | None:
+    """Bake the clean floor for every frame, in background Blenders: how bright the unshadowed
+    floor is across the frame, so the lighting's falloff isn't taken for shadow."""
+    uid = st(src).uid
+    if uid in FLOOR_JOBS:
+        return None
+    obj = floor_object(node, src)
+    group = floor_group_node(obj)
+    if group is None:
+        return "Add Floor Shadows first."
+    plate = wired_image_node(src, 0)
+    image = plate.image if plate is not None else None
+    if image is None or image.source != "SEQUENCE":
+        return "The clean floor bakes from an image sequence (not a movie)."
+    folder = os.path.dirname(bpy.path.abspath(image.filepath, library=image.library))
+    plates = numbered(folder)
+    if not plates:
+        return "No footage frames found."
+    numbers = sorted(plates)
+    root = bpy.path.abspath("//CorridorKey/Floor") if bpy.data.filepath else os.path.join(
+        tempfile.gettempdir(), "CorridorKey Floor")
+    os.makedirs(root, exist_ok=True)
+    taken = [int(m.group(1)) for f in os.listdir(root) if (m := re.match(r"^clean floor (\d+)$", f))]
+    out_dir = os.path.join(root, f"clean floor {max(taken, default=0) + 1}")
+    os.makedirs(out_dir)
+    work = os.path.join(tempfile.gettempdir(), "CorridorKey Floor", uuid.uuid4().hex[:8])
+    os.makedirs(work)
+    colour = list(group.inputs["Floor Colour"].default_value)[:3]
+    workers = max(1, min(4, (os.cpu_count() or 4) // 4))
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_key_worker.py")
+    flags = 0x08000000 if sys.platform == "win32" else 0
+    processes = []
+    for index in range(workers):
+        request = {
+            "mode": "clean_floor", "frames": [[n, os.path.join(folder, plates[n]), None] for n in numbers],
+            "colour": colour, "direction": _hue_of(colour), "out_dir": out_dir, "prefix": "clean_",
+            "slice": [index, workers],
+        }
+        path = os.path.join(work, f"request_{index}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(request, f)
+        try:
+            processes.append(subprocess.Popen(
+                [bpy.app.binary_path, "-b", "--factory-startup", "--python", script, "--", path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            ))
+        except OSError as exc:
+            for process in processes:
+                process.kill()
+            shutil.rmtree(work, ignore_errors=True)
+            return f"The clean-floor bake didn't start: {exc}"
+    FLOOR_JOBS[uid] = {"processes": processes, "work": work, "out_dir": out_dir, "total": len(numbers),
+                       "object": obj.name, "started": time.monotonic()}
+    PREVIEW_LINE["floor:" + uid] = "Baking the clean floor..."
+    return None
+
+
+def cancel_floor_bake(uid: str) -> None:
+    job = FLOOR_JOBS.get(uid)
+    if job is not None:
+        job["cancelled"] = True
+        for process in job["processes"]:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+def plug_clean_floor(obj, out_dir: str, plate) -> bool:
+    """A finished clean-floor bake into the plane's material (or out of it, with no folder)."""
+    material = obj.active_material if obj is not None else None
+    tree = material.node_tree if material is not None else None
+    group = tree.nodes.get(FLOOR_NODE) if tree is not None else None
+    clean = tree.nodes.get(FLOOR_CLEAN) if tree is not None else None
+    if group is None or clean is None:
+        return False
+    for link in list(group.inputs["Clean Floor"].links):
+        tree.links.remove(link)
+    if not out_dir:
+        clean.image = None
+        return True
+    names = sorted(f for f in os.listdir(out_dir) if f.endswith(".png"))
+    if not names:
+        return False
+    path = os.path.join(out_dir, names[0])
+    if bpy.data.filepath:
+        try:
+            path = bpy.path.relpath(path)
+        except ValueError:
+            pass
+    image = bpy.data.images.load(path, check_existing=False)
+    image.source = "SEQUENCE"
+    image.colorspace_settings.name = "Non-Color"
+    image.name = f"Clean floor ({obj.name})"
+    clean.image = image
+    tree.links.new(clean.outputs["Color"], group.inputs["Clean Floor"])
+    if plate is not None:
+        floor_sync(obj, plate)
+    return True
+
+
+def land_floor_bakes() -> bool:
+    """Clean-floor bakes: how far along; the finished ones plugged into their plane."""
+    changed = False
+    for uid, job in list(FLOOR_JOBS.items()):
+        try:
+            done = len([f for f in os.listdir(job["out_dir"]) if f.endswith(".png")])
+        except OSError:
+            done = 0
+        if any(process.poll() is None for process in job["processes"]):
+            line = f"Baking the clean floor: {done} of {job['total']} frames"
+            if PREVIEW_LINE.get("floor:" + uid) != line:
+                PREVIEW_LINE["floor:" + uid] = line
+                changed = True
+            continue
+        del FLOOR_JOBS[uid]
+        changed = True
+        shutil.rmtree(job["work"], ignore_errors=True)
+        errors = sorted(f for f in os.listdir(job["out_dir"]) if f.startswith("error_")) if os.path.isdir(job["out_dir"]) else []
+        message = ""
+        for name in errors:
+            with open(os.path.join(job["out_dir"], name), encoding="utf-8", errors="replace") as f:
+                message = message or f.read().strip()[:160]
+            os.remove(os.path.join(job["out_dir"], name))
+        obj = bpy.data.objects.get(job["object"])
+        src = node_by_uid(uid)
+        if job.get("cancelled"):
+            PREVIEW_LINE["floor:" + uid] = "Clean-floor bake stopped."
+        elif done < job["total"] or obj is None:
+            PREVIEW_LINE["floor:" + uid] = f"Clean-floor bake stopped at {done} of {job['total']} frames" + (
+                f": {message}" if message else ".")
+        else:
+            plug_clean_floor(obj, job["out_dir"], wired_image_node(src, 0) if src is not None else None)
+            seconds = int(time.monotonic() - job["started"])
+            PREVIEW_LINE["floor:" + uid] = (f"Clean floor baked: {done} frames in {seconds // 60}m "
+                                            f"{seconds % 60:02d}s. Falloff no longer reads as shadow.")
+    return changed
+
+
+class CORRIDORKEY_SHADER_OT_floor_bake(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_bake"
+    bl_label = "Bake Clean Floor"
+    bl_description = (
+        "Measure, frame by frame, how bright the floor is where nothing shades it (a smooth fit "
+        "that ignores shadows), so uneven lighting isn't taken for shadow. Runs in the background"
+    )
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        if node is None or src is None:
+            return {"CANCELLED"}
+        why = start_floor_bake(node, src, context.scene)
+        if why:
+            PREVIEW_LINE["floor:" + self.uid] = why
+            self.report({"WARNING"}, why)
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_bake_cancel(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_bake_cancel"
+    bl_label = "Stop Baking"
+    bl_description = "Stop baking the clean floor"
+
+    def execute(self, context):
+        cancel_floor_bake(self.uid)
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_unbake(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_unbake"
+    bl_label = "Use the Floor Colour Only"
+    bl_description = "Unplug the baked clean floor: the whole floor is compared with the Floor Colour"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        obj = floor_object(node, src) if node is not None and src is not None else None
+        if obj is None:
+            return {"CANCELLED"}
+        plug_clean_floor(obj, "", None)
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_add(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_add"
+    bl_label = "Add Floor Shadows"
+    bl_description = (
+        "Keep the real shadows on the floor: a see-through plane on the floor (Z = 0) that darkens "
+        "what's behind it wherever the footage's floor is shadowed. It sees the footage through "
+        "the camera, so it follows the camera by itself"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        if node is None or src is None:
+            return {"CANCELLED"}
+        obj, note = make_floor_shadows(node, src, context.scene)
+        if obj is None:
+            self.report({"WARNING"}, note)
+            return {"CANCELLED"}
+        PREVIEW_LINE["floor:" + self.uid] = note or "Floor colour sampled from this frame."
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_fit(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_fit"
+    bl_label = "Fit to View"
+    bl_description = "Reshape the floor plane to what the camera sees of the floor on this frame"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        obj = floor_object(node, src) if node is not None and src is not None else None
+        corners = floor_footprint(context.scene)
+        if obj is None or corners is None:
+            return {"CANCELLED"}
+        inverse = obj.matrix_world.inverted()
+        floor_mesh(obj.data, [inverse @ p for p in corners])
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_sample(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_sample"
+    bl_label = "Sample Floor Colour"
+    bl_description = "Measure the clean floor's colour on the frame you're on (pick a frame with little shadow)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        obj = floor_object(node, src) if node is not None and src is not None else None
+        group = floor_group_node(obj)
+        if group is None:
+            return {"CANCELLED"}
+        colour, why = sample_floor_colour(node, src, context.scene, obj)
+        if colour is None:
+            PREVIEW_LINE["floor:" + self.uid] = why
+            self.report({"WARNING"}, why)
+            return {"CANCELLED"}
+        group.inputs["Floor Colour"].default_value = (*colour, 1.0)
+        PREVIEW_LINE["floor:" + self.uid] = f"Floor colour sampled on frame {context.scene.frame_current}."
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_matte(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_matte"
+    bl_label = "Show Matte"
+    bl_description = "Show the shadow matte itself (white = darkened), to tune Lift and Screen Gate"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        group = floor_group_node(floor_object(node, src)) if node is not None and src is not None else None
+        if group is None:
+            return {"CANCELLED"}
+        socket = group.inputs["Show Matte"]
+        socket.default_value = 0.0 if socket.default_value > 0.5 else 1.0
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_floor_remove(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_remove"
+    bl_label = "Remove Floor Shadows"
+    bl_description = "Delete the floor-shadow plane and its material"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        obj = floor_object(node, src) if node is not None and src is not None else None
+        if obj is None:
+            return {"CANCELLED"}
+        cancel_floor_bake(self.uid)
+        mesh, materials = obj.data, [m for m in obj.data.materials if m is not None]
+        bpy.data.objects.remove(obj)
+        if mesh.users == 0:
+            bpy.data.meshes.remove(mesh)
+        for material in materials:
+            if material.users == 0:
+                bpy.data.materials.remove(material)
+        node.corridorkey_shader.floor_name = ""
+        PREVIEW_LINE.pop("floor:" + self.uid, None)
+        return {"FINISHED"}
+
+
+def draw_floor_shadows(layout, node, src, scene) -> None:
+    uid, settings = st(src).uid, node.corridorkey_shader
+    obj = floor_object(node, src)
+    group = floor_group_node(obj)
+    showing = group is not None and group.inputs["Show Matte"].default_value > 0.5
+    note = ("baking" if uid in FLOOR_JOBS else "showing the matte" if showing else "on") if group is not None else ""
+    box = _fold(layout, settings, "ui_floor", "Floor Shadows", "MESH_PLANE", note)
+    if group is None:
+        _lines(box, "Keep the real shadows on the floor: a see-through plane on the floor that "
+                    "darkens what's behind it where the footage is shadowed. It follows the camera "
+                    "by itself.", "INFO", 40)
+        row = box.row()
+        row.scale_y = 1.3
+        row.operator(CORRIDORKEY_SHADER_OT_floor_add.bl_idname, icon="ADD").uid = uid
+        return
+    row = box.row(align=True)
+    row.prop(group.inputs["Floor Colour"], "default_value", text="Floor")
+    row.operator(CORRIDORKEY_SHADER_OT_floor_sample.bl_idname, text="", icon="EYEDROPPER").uid = uid
+    column = box.column(align=True)
+    for name in ("Density", "Lift", "Screen Gate", "Keep Colour", "Edge Feather"):
+        column.prop(group.inputs[name], "default_value", text=name, slider=True)
+    baked = bool(group.inputs["Clean Floor"].links)
+    row = box.row(align=True)
+    if uid in FLOOR_JOBS:
+        row.operator(CORRIDORKEY_SHADER_OT_floor_bake_cancel.bl_idname, icon="CANCEL").uid = uid
+    else:
+        row.operator(CORRIDORKEY_SHADER_OT_floor_bake.bl_idname,
+                     text="Re-bake Clean Floor" if baked else "Bake Clean Floor", icon="LIGHT_AREA").uid = uid
+        if baked:
+            row.operator(CORRIDORKEY_SHADER_OT_floor_unbake.bl_idname, text="", icon="X").uid = uid
+    if not baked and uid not in FLOOR_JOBS:
+        box.label(text="Uneven lighting reads as shadow until you bake.", icon="INFO")
+    row = box.row(align=True)
+    row.operator(CORRIDORKEY_SHADER_OT_floor_matte.bl_idname, icon="HIDE_OFF", depress=showing).uid = uid
+    row.operator(CORRIDORKEY_SHADER_OT_floor_fit.bl_idname, icon="FULLSCREEN_ENTER").uid = uid
+    row.operator(CORRIDORKEY_SHADER_OT_floor_remove.bl_idname, text="", icon="TRASH").uid = uid
+    line = PREVIEW_LINE.get("floor:" + uid)
+    if uid in FLOOR_JOBS and line:
+        draw_progress(box, line)
+    elif line:
+        _lines(box, line, "BLANK1", 40)
+    _lines(box, f"Plane: {obj.name}. Lines up through the camera; shrink it in Edit Mode to the "
+                "green floor if walls get in.", "BLANK1", 40)
+
+
 def _paid_op(name: str) -> str | None:
     """Corridor's operator `corridorkey.<name>`, when its add-on has it."""
     return f"corridorkey.{name}" if hasattr(bpy.ops.corridorkey, name) else None
@@ -5288,6 +6017,14 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_screen_hint,
     CORRIDORKEY_SHADER_OT_screen_preset,
     CORRIDORKEY_SHADER_OT_pick_render_folder,
+    CORRIDORKEY_SHADER_OT_floor_add,
+    CORRIDORKEY_SHADER_OT_floor_fit,
+    CORRIDORKEY_SHADER_OT_floor_sample,
+    CORRIDORKEY_SHADER_OT_floor_matte,
+    CORRIDORKEY_SHADER_OT_floor_remove,
+    CORRIDORKEY_SHADER_OT_floor_bake,
+    CORRIDORKEY_SHADER_OT_floor_bake_cancel,
+    CORRIDORKEY_SHADER_OT_floor_unbake,
     CORRIDORKEY_SHADER_OT_cancel_screen_hint,
     CORRIDORKEY_SHADER_OT_sam3_check,
     CORRIDORKEY_SHADER_OT_sam3_install,
