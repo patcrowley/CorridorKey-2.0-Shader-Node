@@ -2546,6 +2546,7 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     ui_floor_detect: bpy.props.BoolProperty(name="Floor Detection", default=False)
     ui_floor_look: bpy.props.BoolProperty(name="Look", default=False)
     ui_floor_area: bpy.props.BoolProperty(name="Area", default=False)
+    ui_floor_crop: bpy.props.BoolProperty(name="Crop", default=True)
     ui_floor_clean: bpy.props.BoolProperty(name="Clean Floor", default=True)
     screen_show: bpy.props.BoolProperty(
         name="Show Matte",
@@ -4438,7 +4439,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 3
+FLOOR_VERSION = 4
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4497,7 +4498,15 @@ def ensure_floor_group():
     add("Screen Gate", "NodeSocketFloat", 0.03, 0.0, 0.5,
         "How much of the screen's hue a pixel needs to count as floor (raise it if the actor's edges darken)")
     add("Gate Softness", "NodeSocketFloat", 0.05, 0.0, 0.5, "How gradually pixels go from 'not floor' to 'floor'")
-    add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's edges (share of its size)")
+    add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's (cropped) edges (share of its size)")
+    for side, about in (("Left", "the camera's left"), ("Right", "the camera's right"),
+                        ("Near", "the side nearest the camera"), ("Far", "the far side")):
+        add(f"Crop {side}", "NodeSocketFloat", 0.0, 0.0, 0.95,
+            f"Cut the floor plane back from {about} (share of its size): stays put on the floor as the camera moves")
+    for side in ("Left", "Right", "Top", "Bottom"):
+        add(f"Frame {side}", "NodeSocketFloat", 0.0, 0.0, 0.95,
+            f"Cut the shadows back from the picture's {side.lower()} edge (share of the frame): stays put in frame")
+    add("Frame Softness", "NodeSocketFloat", 0.02, 0.0, 0.5, "How soft the frame crop's edges are")
     add("Fade Start", "NodeSocketFloat", 40.0, 0.0, 1000.0, "Distance from the camera (m) where shadows start to fade out")
     add("Fade End", "NodeSocketFloat", 50.0, 0.0, 1000.0, "Distance from the camera (m) where they're gone")
     add("View", "NodeSocketFloat", 0.0, 0.0, 3.0, "0 result, 1 shadow matte, 2 floor detection, 3 clean floor")
@@ -4583,16 +4592,33 @@ def ensure_floor_group():
     coords = node("ShaderNodeTexCoord")
     split = node("ShaderNodeSeparateXYZ")
     links.new(coords.outputs["UV"], split.inputs[0])
-    u, v = split.outputs["X"], split.outputs["Y"]
+    # the plane's UVs run left to right (u) and near to far (v) as the camera sees them: the floor
+    # crop rescales them, so the cropped area runs 0-1 and the edge feather follows the crop
+    u = math("DIVIDE", math("SUBTRACT", split.outputs["X"], get("Crop Left")),
+             math("MAXIMUM", math("SUBTRACT", math("SUBTRACT", 1.0, get("Crop Left")), get("Crop Right")), 1e-3))
+    v = math("DIVIDE", math("SUBTRACT", split.outputs["Y"], get("Crop Near")),
+             math("MAXIMUM", math("SUBTRACT", math("SUBTRACT", 1.0, get("Crop Near")), get("Crop Far")), 1e-3))
     inner = math("MINIMUM", math("MINIMUM", u, math("SUBTRACT", 1.0, u)),
                  math("MINIMUM", v, math("SUBTRACT", 1.0, v)))
     edge = smooth(inner, 0.0, math("MAXIMUM", get("Edge Feather"), 1e-4))
+    # the frame crop, in the picture (window) coordinates: fully in at the crop line, fading out
+    # over Frame Softness beyond it
+    screen = node("ShaderNodeSeparateXYZ")
+    links.new(coords.outputs["Window"], screen.inputs[0])
+    soft = math("MAXIMUM", get("Frame Softness"), 1e-4)
+    framed = 1.0
+    for value, side in ((screen.outputs["X"], "Frame Left"), (math("SUBTRACT", 1.0, screen.outputs["X"]), "Frame Right"),
+                        (screen.outputs["Y"], "Frame Bottom"), (math("SUBTRACT", 1.0, screen.outputs["Y"]), "Frame Top")):
+        cut = get(side)
+        framed = math("MULTIPLY", framed, smooth(value, math("SUBTRACT", cut, soft), cut))
+    edge = math("MULTIPLY", edge, framed)
     camera = node("ShaderNodeCameraData")
     start = get("Fade Start")
     far = math("SUBTRACT", 1.0, smooth(camera.outputs["View Distance"], start,
                                         math("MAXIMUM", get("Fade End"), math("ADD", start, 1e-3))))
 
-    amount = math("MULTIPLY", math("MULTIPLY", math("MULTIPLY", shade, floor), edge), far, clamp=True)
+    area = math("MULTIPLY", edge, far)  # the plane's edges, the crops, the distance fade
+    amount = math("MULTIPLY", math("MULTIPLY", shade, floor), area, clamp=True)
     ratio = mix(1.0, (0, 0, 0, 1), vmath("DIVIDE", plate, vmath("MAXIMUM", clean, (1e-4, 1e-4, 1e-4))), clamp=True)
     core = mix(get("Keep Colour"), get("Shadow Tint"), ratio)
     multiply = mix(amount, (1, 1, 1, 1), core, clamp=True)
@@ -4601,7 +4627,7 @@ def ensure_floor_group():
     view = get("View")
     showing = math("ADD", math("ADD",
                    math("MULTIPLY", amount, math("COMPARE", view, 1.0, c=0.5)),
-                   math("MULTIPLY", floor, math("COMPARE", view, 2.0, c=0.5))),
+                   math("MULTIPLY", math("MULTIPLY", floor, area), math("COMPARE", view, 2.0, c=0.5))),
                    math("MULTIPLY", math("MULTIPLY", level, 0.5), math("COMPARE", view, 3.0, c=0.5)), clamp=True)
     see_through = node("ShaderNodeBsdfTransparent")
     links.new(multiply, see_through.inputs["Color"])
@@ -4855,32 +4881,65 @@ def shot_footprint(scene, every: int | None = None):
     if frames[-1] != last:
         frames.append(last)
     current, sub = scene.frame_current, scene.frame_subframe
-    points = []
+    points, forward = [], Vector((0.0, 0.0))
     try:
         for frame in frames:
             scene.frame_set(frame)
             corners = floor_footprint(scene)
             if corners is not None:
                 points += [(round(p.x, 4), round(p.y, 4)) for p in corners]
+                forward += camera_forward(scene)
     finally:
         scene.frame_set(current, subframe=sub)
     rectangle = _smallest_rectangle(points, margin=0.1)
-    return [Vector((x, y, FLOOR_LIFT)) for x, y in rectangle] if rectangle else None
+    if not rectangle:
+        return None
+    return orient_corners([Vector((x, y, FLOOR_LIFT)) for x, y in rectangle], forward)
+
+
+def camera_forward(scene):
+    """Where the camera looks, flat on the floor (a 2D unit vector; zero looking straight down)."""
+    from mathutils import Vector
+
+    look = scene.camera.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))
+    flat = Vector((look.x, look.y))
+    return flat.normalized() if flat.length > 1e-6 else flat
+
+
+def orient_corners(corners, forward):
+    """The plane's four corners ordered near-left, near-right, far-right, far-left as the camera
+    looks along `forward`: its UVs then run left to right and near to far (for the floor crop)."""
+    if forward.length < 1e-6:
+        return corners
+    forward = forward.normalized()
+    right = forward.copy()
+    right.x, right.y = forward.y, -forward.x  # the camera's right, seen from above
+    best, chosen = None, corners
+    for start in range(4):
+        for step in (1, -1):
+            order = [corners[(start + step * i) % 4] for i in range(4)]
+            across = (order[1] - order[0]).to_2d().normalized()
+            along = (order[3] - order[0]).to_2d().normalized()
+            score = across.dot(right) + along.dot(forward)
+            if best is None or score > best:
+                best, chosen = score, order
+    return chosen
 
 
 def floor_mesh(mesh, corners) -> None:
-    """The plane's mesh: one quad through the corners, facing up, UVs 0-1 (for the edge fade)."""
+    """The plane's mesh: one quad through the corners, facing up. UVs (0,0) (1,0) (1,1) (0,1) go
+    to the corners in the order given (near-left, near-right, far-right, far-left), whichever way
+    round the face has to be built to face up."""
     import bmesh
 
-    a, b, c = corners[0], corners[1], corners[2]
-    if (b - a).cross(c - a).z < 0:  # face up
-        corners = list(reversed(corners))
     bm = bmesh.new()
     verts = [bm.verts.new(p) for p in corners]
-    face = bm.faces.new(verts)
+    coords = dict(zip(verts, ((0, 0), (1, 0), (1, 1), (0, 1))))
+    a, b, c = corners[0], corners[1], corners[2]
+    face = bm.faces.new(verts if (b - a).cross(c - a).z >= 0 else list(reversed(verts)))
     uv = bm.loops.layers.uv.new("UVMap")
-    for loop, coord in zip(face.loops, ((0, 0), (1, 0), (1, 1), (0, 1))):
-        loop[uv].uv = coord
+    for loop in face.loops:
+        loop[uv].uv = coords[loop.vert]
     bm.to_mesh(mesh)
     bm.free()
     mesh.update()
@@ -5233,7 +5292,11 @@ class CORRIDORKEY_SHADER_OT_floor_fit(_OnSource, bpy.types.Operator):
     def execute(self, context):
         node, src = node_by_source(self.uid), self.source()
         obj = floor_object(node, src) if node is not None and src is not None else None
-        corners = shot_footprint(context.scene) if self.scope == "SHOT" else floor_footprint(context.scene)
+        if self.scope == "SHOT":
+            corners = shot_footprint(context.scene)
+        else:
+            corners = floor_footprint(context.scene)
+            corners = orient_corners(corners, camera_forward(context.scene)) if corners else None
         if obj is None or corners is None:
             self.report({"WARNING"}, "Needs the floor plane and the scene camera above the floor.")
             return {"CANCELLED"}
@@ -5340,7 +5403,7 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         row.operator(CORRIDORKEY_SHADER_OT_floor_add.bl_idname, icon="ADD").uid = uid
         return
     inputs = group.inputs
-    if "View" not in inputs:  # an older plane: the next sync brings it up to date
+    if "Crop Left" not in inputs:  # an older plane: the next sync brings it up to date
         box.label(text="Updating the floor plane...", icon="TIME")
         return
 
@@ -5387,6 +5450,19 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     sliders(look, "Density")
     look.prop(inputs["Shadow Tint"], "default_value", text="Tint")
     sliders(look, "Keep Colour")
+
+    crop = _fold(box, settings, "ui_floor_crop", "Crop", "FULLSCREEN_EXIT")
+    split = crop.split(factor=0.5)
+    column = split.column(align=True)
+    column.label(text="On the floor")
+    for side in ("Left", "Right", "Near", "Far"):
+        column.prop(inputs[f"Crop {side}"], "default_value", text=side, slider=True)
+    column = split.column(align=True)
+    column.label(text="In the frame")
+    for side in ("Left", "Right", "Top", "Bottom"):
+        column.prop(inputs[f"Frame {side}"], "default_value", text=side, slider=True)
+    crop.prop(inputs["Frame Softness"], "default_value", text="Frame Crop Softness", slider=True)
+    crop.label(text="View Floor shows the crop. Floor crops stay on the floor.", icon="INFO")
 
     area = _fold(box, settings, "ui_floor_area", "Area", "SELECT_SET")
     sliders(area, "Edge Feather")
