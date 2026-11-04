@@ -4458,7 +4458,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 5
+FLOOR_VERSION = 6
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4516,9 +4516,16 @@ def ensure_floor_group():
         about="The colour at the shadow's core: black is a neutral shadow; a dark colour matches a coloured scene")
     add("Keep Colour", "NodeSocketFloat", 0.0, 0.0, 1.0,
         "Use the shadows' own colour from the footage instead of the tint (can carry screen spill)")
-    add("Screen Gate", "NodeSocketFloat", 0.03, 0.0, 0.5,
-        "How much of the screen's hue a pixel needs to count as floor (raise it if the actor's edges darken)")
-    add("Gate Softness", "NodeSocketFloat", 0.05, 0.0, 0.5, "How gradually pixels go from 'not floor' to 'floor'")
+    add("Hue Gate", "NodeSocketFloat", 0.45, 0.0, 1.0,
+        "How close to the floor's hue a pixel must be to count as floor, however dark it is (a shadow "
+        "keeps the floor's hue). Raise it if grey or skin-toned things darken, lower it if shadows have holes")
+    add("Hue Softness", "NodeSocketFloat", 0.15, 0.0, 0.5, "How gradually pixels go from 'not floor' to 'floor'")
+    add("Darkest Shadow", "NodeSocketFloat", 0.2, 0.0, 0.9,
+        "Anything darker than this share of the clean floor isn't shadow but something on it (a dark "
+        "suit with screen spill): it's left alone")
+    for index in range(1, len(FLOOR_AROUND) + 1):
+        add(f"Around {index}", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
+            about="The plate a little way off (Actor Margin): a point counts as floor only if these do too")
     add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's (cropped) edges (share of its size)")
     for side, about in (("Left", "the camera's left"), ("Right", "the camera's right"),
                         ("Near", "the side nearest the camera"), ("Far", "the far side")):
@@ -4560,7 +4567,7 @@ def ensure_floor_group():
             _feed(links, n.inputs[1], b)
         if scale is not None:
             _feed(links, n.inputs["Scale"], scale)
-        return n.outputs["Value" if op == "DOT_PRODUCT" else "Vector"]
+        return n.outputs["Value" if op in {"DOT_PRODUCT", "LENGTH"} else "Vector"]
 
     def smooth(value, low, high):
         n = node("ShaderNodeMapRange", data_type="FLOAT", interpolation_type="SMOOTHSTEP", clamp=True)
@@ -4601,13 +4608,32 @@ def ensure_floor_group():
     shade = math("POWER", shade, math("DIVIDE", 1.0, math("MAXIMUM", get("Gamma"), 0.01)))
     shade = math("MULTIPLY", shade, get("Density"), clamp=True)
 
-    # floor detection: only where the plate still leans to the screen's hue (display-like values)
+    # floor detection (display-like values): the floor's hue, as a share of the floor colour's own
+    # (a shadow darkens the floor but keeps its hue: dark shadows stay floor); and not darker than
+    # the darkest shadow (a dark suit with screen spill has the hue too, but is far darker). Checked
+    # here and a little way around (Actor Margin), so the actor's soft edges don't count either.
     clean_d = gamma(clean)
     mean = vmath("DOT_PRODUCT", clean_d, (1 / 3, 1 / 3, 1 / 3))
     hue = vmath("NORMALIZE", vmath("SUBTRACT", clean_d, vmath("SCALE", (1.0, 1.0, 1.0), scale=mean)))
-    lean = vmath("DOT_PRODUCT", gamma(plate), hue)
-    gate = get("Screen Gate")
-    floor = smooth(lean, gate, math("ADD", gate, math("MAXIMUM", get("Gate Softness"), 1e-4)))
+
+    def hueness(shown):
+        return math("DIVIDE", vmath("DOT_PRODUCT", shown, hue), math("ADD", vmath("LENGTH", shown), 0.03))
+
+    own = math("MAXIMUM", hueness(clean_d), 1e-3)
+    gate = get("Hue Gate")
+    gate_top = math("ADD", gate, math("MAXIMUM", get("Hue Softness"), 1e-4))
+    darkest = get("Darkest Shadow")
+    full = math("MAXIMUM", math("MULTIPLY", vmath("DOT_PRODUCT", clean, clean), level), 1e-6)
+
+    def floorness(colour, lit):
+        on_hue = smooth(math("DIVIDE", hueness(gamma(colour)), own), gate, gate_top)
+        return math("MULTIPLY", on_hue, smooth(lit, darkest, math("ADD", darkest, 0.08)))
+
+    floor = floorness(plate, there)
+    for index in range(1, len(FLOOR_AROUND) + 1):
+        colour = get(f"Around {index}")
+        lit = math("DIVIDE", vmath("DOT_PRODUCT", colour, clean), full, clamp=True)
+        floor = math("MINIMUM", floor, floorness(colour, lit))
 
     # the area: faded towards the plane's edges, and with distance from the camera
     coords = node("ShaderNodeTexCoord")
@@ -4684,7 +4710,9 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
               (0.866, -0.5),
 ]
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
-FLOOR_MATERIAL_VERSION = 4
+FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
+FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
+FLOOR_MATERIAL_VERSION = 5
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4822,6 +4850,32 @@ def build_floor_material(material) -> None:
             links.new(texture.outputs["Color"], add.inputs[1])
             add.location = (-50, -260 * index)
             total = add.outputs["Vector"]
+    margin = nodes.new("ShaderNodeValue")
+    margin.name = margin.label = FLOOR_MARGIN
+    margin.outputs[0].default_value = 0.004
+    margin.location = (-900, 300)
+    for index, (dx, dy) in enumerate(FLOOR_AROUND, start=1):
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.name = texture.label = f"{FLOOR_TEX} Around {index}"
+        texture.extension = "EXTEND"
+        texture.location = (-300, 300 + 260 * index)
+        step = nodes.new("ShaderNodeCombineXYZ")
+        step.inputs[1].default_value = dy
+        across = nodes.new("ShaderNodeMath")
+        across.operation = "MULTIPLY"
+        across.inputs[0].default_value = dx
+        links.new(aspect.outputs[0], across.inputs[1])
+        links.new(across.outputs[0], step.inputs[0])
+        scaled = nodes.new("ShaderNodeVectorMath")
+        scaled.operation = "SCALE"
+        links.new(step.outputs[0], scaled.inputs[0])
+        links.new(margin.outputs[0], scaled.inputs["Scale"])
+        moved = nodes.new("ShaderNodeVectorMath")
+        moved.operation = "ADD"
+        links.new(screen, moved.inputs[0])
+        links.new(scaled.outputs["Vector"], moved.inputs[1])
+        links.new(moved.outputs["Vector"], texture.inputs["Vector"])
+        links.new(texture.outputs["Color"], group.inputs[f"Around {index}"])
     average = nodes.new("ShaderNodeVectorMath")
     average.operation = "SCALE"
     links.new(total, average.inputs[0])
@@ -5679,7 +5733,10 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         matte.prop(blur.outputs[0], "default_value", text="Blur (share of height)")
 
     detect = _fold(box, settings, "ui_floor_detect", "Floor Detection", "RESTRICT_SELECT_OFF")
-    sliders(detect, "Screen Gate", "Gate Softness")
+    sliders(detect, "Hue Gate", "Hue Softness", "Darkest Shadow")
+    margin = obj.active_material.node_tree.nodes.get(FLOOR_MARGIN)
+    if margin is not None:
+        detect.prop(margin.outputs[0], "default_value", text="Actor Margin (share of height)")
     detect.label(text="View Floor shows what counts: the actor must be black.", icon="INFO")
 
     look = _fold(box, settings, "ui_floor_look", "Look", "SHADING_RENDERED")

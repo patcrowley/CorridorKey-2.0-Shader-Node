@@ -134,7 +134,12 @@ def floor_samples(rgb: np.ndarray, display: bool, grid: np.ndarray, view, colour
         shown = to_display(linear)
     colour = np.asarray(colour, np.float64)
     share = linear @ colour / max(float(colour @ colour), 1e-9)
-    floor = (shown @ np.asarray(direction, np.float64)) > 0.06
+    # the floor's hue however dark (as the add-on's Hue Gate), and not as dark as a dark suit
+    direction = np.asarray(direction, np.float64)
+    own = to_display(colour)
+    own = max(float(own @ direction) / (float(np.linalg.norm(own)) + 0.03), 1e-3)
+    hueness = (shown @ direction) / (np.linalg.norm(shown, axis=-1) + 0.03) / own
+    floor = (hueness > 0.45) & (share > 0.15)
     return share, inside & floor
 
 
