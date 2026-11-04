@@ -4,13 +4,13 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 > Not made by or affiliated with Corridor Digital. CorridorKey is theirs; this add-on drives either their paid Blender add-on or the free, open-source CorridorKey 2.0.
 
-![A green-screen plate keyed live on a plane in Blender's viewport, with the CorridorKey 2.0 sidebar, the rendered key on the timeline and the node in the Shader Editor](docs/images/overview.png)
+![The actor keyed by CorridorKey on a footage plane in Blender's camera view, with his real shadow kept on the floor by Floor Shadows, the CorridorKey 2.0 sidebar, the rendered key on the timeline and the node in the Shader Editor](docs/images/overview.png)
 
 ## Features
 
 - **Shader node:** add it from **Add > Texture > CorridorKey 2.0**. It has Image and Alpha Hint inputs, and Color and Alpha outputs.
 
-  ![The CorridorKey 2.0 node between the footage and matte textures and the material's shaders](docs/images/nodes.png)
+  ![The CorridorKey 2.0 node taking the footage and an Alpha Hint, feeding the material's Emission and Mix Shader](docs/images/nodes.png)
 - **One-click Set Up:** right-click a footage plane and choose **Set Up CorridorKey 2.0**. It wires the node between the footage and the shader, and uses the plane's matte as the Alpha Hint. It also turns off a compositor key (Jetset/Autoshot) that would cover CorridorKey's.
 - **Controls in the 3D viewport sidebar:** press N and open the **CorridorKey 2.0** tab. A Getting Started checklist covers the engine, footage, saved file and Render Folder, and warnings catch common problems: full paths, missing files, compositing.
 - **Previews:**
@@ -21,13 +21,13 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 - **Progress bars** for renders, SAM 3 hints and Screen Key bakes.
 - **Timeline bars:** blue for the rendered key (it grows frame by frame while a render runs), green for previews, orange for frames being keyed.
 
-  ![The blue rendered-key bar across the whole shot on Blender's timeline](docs/images/timeline.png)
+  ![Blender's timeline: the blue rendered-key bar across the whole shot, and short green bars where previews are cached](docs/images/timeline.png)
 - **Render box:**
   - **Whole Shot**, or **Some Frames** to re-render or test a stretch, into the current key or a new test folder.
-  - F12 keys the current frame first.
+  - F12 keys the current frame first, unless that frame already shows the rendered key.
   - Delete Render.
 
-  <img src="docs/images/render_box.png" alt="The Render box: Whole Shot or Some Frames, Render Shot, the F12 option, the key's folder, Open Folder, Delete Render and Lock" width="260">
+  <img src="docs/images/render_box.png" alt="The Render box: Whole Shot or Some Frames with a frame range, Current Key or New Test Folder, Preview and Render, the F12 option, Show the Rendered Key, the key's folder, Open Folder, Delete Render and Lock" width="300">
 - **Lock for Render Farm:** freezes the finished key into plain Blender nodes, so the material renders the same on machines without the add-on (SheepIt, farms, other computers). Unlock hands it back.
 - **SAM 3 alpha hints:** type what to keep (for example `person`) and make a matte for one frame or the whole shot. SAM 3 runs only when needed: it gets the GPU while it runs and frees it when it's done.
 - **Screen Key:** a simple keyer for screen that CorridorKey leaves behind. Pick the screen's colour with the eyedropper, or use the Green or Blue preset. **Clean the Key** multiplies the key's alpha by it live, inside the node. **Bake into Alpha Hint** multiplies it into your hint for every frame, so CorridorKey itself treats that screen as background. Tune it with **Show Matte**.
