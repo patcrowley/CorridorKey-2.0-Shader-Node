@@ -143,6 +143,8 @@ a { color: var(--accent); }
 <li><span class="ui">Crop</span>: <span class="ui">On the floor</span> (Left, Right, Near, Far, as the camera sees them) cuts the plane back on the floor itself, so the cut stays put while the camera moves; <span class="ui">In the frame</span> (Left, Right, Top, Bottom) cuts the picture, fixed in frame. View <span class="ui">Floor</span> shows the crop.</li>
 <li><span class="ui">Area</span>: <span class="ui">Edge Feather</span>, a fade with distance from the camera, <span class="ui">Fit Whole Shot</span> or <span class="ui">This Frame</span>, and <span class="ui">Edit Shape</span> to move the plane's corners onto the green floor's edges (the sidebar keeps these settings while you edit; <span class="ui">Done Editing</span> goes back to the footage plane).</li>
 </ol>
+<p><span class="ui">Floor</span> is the object whose flat plane is the floor; Jetset's <code>shim_origin</code> empty is found by itself. The shadow plane is parented to it. <span class="ui">Lay Footage on Floor</span> bends the footage plane where it would go below that floor: that part is laid onto the floor along the camera's sight lines, so the camera sees the same picture while, in the virtual set, the actor's plane rests on the floor instead of passing through it. Above the floor it stays upright.</p>
+<p>The technique follows ActionVFX's tutorial <a href="https://www.youtube.com/watch?v=T8FSeBRx6Rc">How To Retain Green Screen Shadows and Fine Details</a>.</p>
 <p>Every slider can be keyframed (right-click). It lines up when you look through the camera, and renders anywhere: it's plain Blender nodes.</p>
 
 <h2><span class="n">6</span>Render the key</h2>

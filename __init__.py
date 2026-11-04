@@ -2107,7 +2107,7 @@ def sync(
     if settings.floor_name:
         floor = bpy.data.objects.get(settings.floor_name)
         if floor is not None and floor.get(FLOOR_TAG) == st(src).uid:
-            floor_sync(floor, wired_image_node(src, 0))
+            floor_sync(floor, wired_image_node(src, 0), scene)
     if preview is not None:  # this frame has been previewed: show the cache, played as a sequence
         image = preview_image(src, *preview)
         plate = wired_image_node(src, 0)
@@ -2420,6 +2420,14 @@ class CORRIDORKEY_SHADER_OT_connect(bpy.types.Operator):
 # --- preview and reset ----------------------------------------------------------------------------
 
 
+def _bend_changed(self, context) -> None:
+    _bend_settings(self)
+
+
+def _floor_view_changed(self, context) -> None:
+    _floor_view_update(self)
+
+
 def _floor_view_update(settings) -> None:
     obj = bpy.data.objects.get(settings.floor_name) if settings.floor_name else None
     group = floor_group_node(obj)
@@ -2524,13 +2532,25 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     ui_tips: bpy.props.BoolProperty(name="Tips", default=True)
     ui_floor: bpy.props.BoolProperty(name="Floor Shadows", default=True)
     floor_name: bpy.props.StringProperty(options={"HIDDEN"})
+    floor_ref: bpy.props.StringProperty(
+        name="Floor", description="The object whose XY plane is the floor (Jetset's shim origin). "
+        "Empty: the camera's top parent when it's an empty, else the world's Z = 0. Fit the plane again after changing it",
+    )
+    bend_lift: bpy.props.FloatProperty(
+        name="Lift", default=0.001, min=0.0, max=0.05, unit="LENGTH", precision=4,
+        description="How far above the floor the laid-down part rests", update=_bend_changed,
+    )
+    bend_detail: bpy.props.IntProperty(
+        name="Detail", default=6, min=1, max=9, update=_bend_changed,
+        description="How finely the footage plane is divided to bend at the floor (each step doubles)",
+    )
     floor_view: bpy.props.EnumProperty(
         name="View",
         items=[("RESULT", "Result", "The shadows on the scene"),
                ("MATTE", "Matte", "The shadow matte: white is darkened"),
                ("FLOOR", "Floor", "What counts as floor: white is floor, black is the actor and set"),
                ("CLEAN", "Clean", "The baked clean floor's brightness")],
-        default="RESULT", update=lambda self, context: _floor_view_update(self),
+        default="RESULT", update=_floor_view_changed,
     )
     floor_fit_degree: bpy.props.IntProperty(
         name="Fit Detail", min=1, max=5, default=3,
@@ -4439,7 +4459,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 4
+FLOOR_VERSION = 5
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4458,7 +4478,7 @@ def ensure_floor_group():
     tree = bpy.data.node_groups.get(FLOOR_GROUP)
     if tree is not None and tree.get("ck_version") == FLOOR_VERSION:
         return tree
-    kept = []
+    kept, wired = [], []  # the planes' settings and what's plugged into them, put back after
     if tree is None:
         tree = bpy.data.node_groups.new(FLOOR_GROUP, "ShaderNodeTree")
     else:
@@ -4467,6 +4487,7 @@ def ensure_floor_group():
                 if n.bl_idname == "ShaderNodeGroup" and n.node_tree == tree:
                     kept.append((n, {i.name: tuple(i.default_value) if hasattr(i.default_value, "__len__")
                                      else i.default_value for i in n.inputs if hasattr(i, "default_value")}))
+                    wired.append((material.node_tree, n, [(i.name, l.from_socket) for i in n.inputs for l in i.links]))
     tree.nodes.clear()
     tree.interface.clear()
     tree["ck_version"] = FLOOR_VERSION
@@ -4480,6 +4501,7 @@ def ensure_floor_group():
         socket.description = about
 
     add("Footage", "NodeSocketColor", (0.5, 0.5, 0.5, 1.0), about="The plate, seen through the camera")
+    add("Screen", "NodeSocketVector", (0.5, 0.5, 0.0), about="Where this point lands in the camera's frame (0-1)")
     add("Floor Colour", "NodeSocketColor", (0.05, 0.35, 0.06, 1.0),
         about="The floor where nothing shades it: anything darker reads as shadow")
     add("Clean Floor", "NodeSocketFloat", 0.5, 0.0, 1.0,
@@ -4604,7 +4626,7 @@ def ensure_floor_group():
     # the frame crop, in the picture (window) coordinates: fully in at the crop line, fading out
     # over Frame Softness beyond it
     screen = node("ShaderNodeSeparateXYZ")
-    links.new(coords.outputs["Window"], screen.inputs[0])
+    links.new(get("Screen"), screen.inputs[0])
     soft = math("MAXIMUM", get("Frame Softness"), 1e-4)
     framed = 1.0
     for value, side in ((screen.outputs["X"], "Frame Left"), (math("SUBTRACT", 1.0, screen.outputs["X"]), "Frame Right"),
@@ -4649,6 +4671,10 @@ def ensure_floor_group():
                     socket.default_value = value
                 except (TypeError, ValueError):
                     pass
+    for owner, n, plugged in wired:  # rebuilding the inputs unplugs them: plug them back
+        for name, from_socket in plugged:
+            if n.inputs.get(name) is not None:
+                owner.links.new(from_socket, n.inputs[name])
     return tree
 
 
@@ -4659,7 +4685,8 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
               (0.866, -0.5),
 ]
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
-FLOOR_MATERIAL_VERSION = 2
+FLOOR_MATERIAL_VERSION = 3
+FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
 def build_floor_material(material) -> None:
@@ -4670,7 +4697,7 @@ def build_floor_material(material) -> None:
     nodes, links = tree.nodes, tree.links
     group = nodes.get(FLOOR_NODE)
     clean = nodes.get(FLOOR_CLEAN)
-    baked = clean is not None and clean.image is not None and group is not None and bool(group.inputs["Clean Floor"].links)
+    baked = clean is not None and clean.image is not None
     for n in list(nodes):
         if n not in (group, clean):
             nodes.remove(n)
@@ -4687,9 +4714,64 @@ def build_floor_material(material) -> None:
     out = nodes.new("ShaderNodeOutputMaterial")
     out.location = (700, 0)
     links.new(group.outputs["Shader"], out.inputs["Surface"])
+    # where each point lands in the camera's frame, worked out from the camera itself (its lens,
+    # sensor, shift): the same in the viewport and the render. (Window coordinates follow the
+    # viewport's whole area, not the camera frame, so the viewport showed it slightly off.)
     coords = nodes.new("ShaderNodeTexCoord")
-    coords.location = (-900, 0)
-    links.new(coords.outputs["Window"], clean.inputs["Vector"])
+    coords.location = (-1500, 0)
+    split = nodes.new("ShaderNodeSeparateXYZ")
+    split.location = (-1350, 0)
+    links.new(coords.outputs["Camera"], split.inputs[0])
+    depth = nodes.new("ShaderNodeMath")
+    depth.operation = "ABSOLUTE"
+    links.new(split.outputs["Z"], depth.inputs[0])
+    safe = nodes.new("ShaderNodeMath")
+    safe.operation = "MAXIMUM"
+    links.new(depth.outputs[0], safe.inputs[0])
+    safe.inputs[1].default_value = 1e-4
+    lens = nodes.new("ShaderNodeValue")
+    lens.name = lens.label = FLOOR_LENS
+    lens.outputs[0].default_value = 50.0
+    lens.location = (-1500, -250)
+    factors = {}
+    for i, name in enumerate(FLOOR_FACTORS):
+        value = nodes.new("ShaderNodeValue")
+        value.name = value.label = name
+        value.outputs[0].default_value = 0.0
+        value.location = (-1500, -350 - 100 * i)
+        factors[name] = value.outputs[0]
+    axes = []
+    for axis, k, shift in ((split.outputs["X"], "CK Floor KX", "CK Floor SX"),
+                           (split.outputs["Y"], "CK Floor KY", "CK Floor SY")):
+        over = nodes.new("ShaderNodeMath")
+        over.operation = "DIVIDE"
+        links.new(axis, over.inputs[0])
+        links.new(safe.outputs[0], over.inputs[1])
+        scale = nodes.new("ShaderNodeMath")
+        scale.operation = "MULTIPLY"
+        links.new(lens.outputs[0], scale.inputs[0])
+        links.new(factors[k], scale.inputs[1])
+        times = nodes.new("ShaderNodeMath")
+        times.operation = "MULTIPLY"
+        links.new(over.outputs[0], times.inputs[0])
+        links.new(scale.outputs[0], times.inputs[1])
+        moved_ = nodes.new("ShaderNodeMath")
+        moved_.operation = "ADD"
+        links.new(times.outputs[0], moved_.inputs[0])
+        links.new(factors[shift], moved_.inputs[1])
+        centred = nodes.new("ShaderNodeMath")
+        centred.operation = "ADD"
+        links.new(moved_.outputs[0], centred.inputs[0])
+        centred.inputs[1].default_value = 0.5
+        axes.append(centred.outputs[0])
+    framed = nodes.new("ShaderNodeCombineXYZ")
+    framed.name = framed.label = "CK Floor Screen"
+    framed.location = (-1000, 0)
+    links.new(axes[0], framed.inputs[0])
+    links.new(axes[1], framed.inputs[1])
+    screen = framed.outputs[0]
+    links.new(screen, clean.inputs["Vector"])
+    links.new(screen, group.inputs["Screen"])
     if baked:
         links.new(clean.outputs["Color"], group.inputs["Clean Floor"])
     blur = nodes.new("ShaderNodeValue")
@@ -4707,7 +4789,7 @@ def build_floor_material(material) -> None:
         texture.extension = "EXTEND"
         texture.location = (-300, -260 * index)
         if index == 0:
-            links.new(coords.outputs["Window"], texture.inputs["Vector"])
+            links.new(screen, texture.inputs["Vector"])
         else:  # the window position, nudged by (dx * aspect, dy) * blur (blur: share of the height)
             step = nodes.new("ShaderNodeCombineXYZ")
             step.inputs[1].default_value = dy
@@ -4725,7 +4807,7 @@ def build_floor_material(material) -> None:
             scaled.location = (-550, -260 * index)
             moved = nodes.new("ShaderNodeVectorMath")
             moved.operation = "ADD"
-            links.new(coords.outputs["Window"], moved.inputs[0])
+            links.new(screen, moved.inputs[0])
             links.new(scaled.outputs["Vector"], moved.inputs[1])
             moved.location = (-450, -260 * index)
             links.new(moved.outputs["Vector"], texture.inputs["Vector"])
@@ -4764,9 +4846,51 @@ def floor_group_node(obj):
     return tree.nodes.get(FLOOR_NODE) if tree is not None else None
 
 
-def floor_sync(obj, plate) -> bool:
+def floor_camera(material, scene) -> bool:
+    """The camera's numbers in the plane's material: its lens (driven, so a zoom is followed),
+    and its sensor, shift and the render's shape (set here)."""
+    camera = scene.camera if scene is not None else None
+    nodes = material.node_tree.nodes
+    lens = nodes.get(FLOOR_LENS)
+    if camera is None or camera.type != "CAMERA" or lens is None:
+        return False
+    data, render = camera.data, scene.render
+    rx = render.resolution_x * render.pixel_aspect_x
+    ry = render.resolution_y * render.pixel_aspect_y
+    across = data.sensor_fit == "HORIZONTAL" or (data.sensor_fit == "AUTO" and rx >= ry)
+    sensor = data.sensor_height if data.sensor_fit == "VERTICAL" else data.sensor_width
+    if across:
+        kx = 1.0 / sensor
+        ky = kx * rx / ry
+    else:
+        ky = 1.0 / sensor
+        kx = ky * ry / rx
+    big = max(rx, ry)
+    changed = False
+    for name, value in zip(FLOOR_FACTORS, (kx, ky, -data.shift_x * big / rx, -data.shift_y * big / ry)):
+        node = nodes.get(name)
+        if node is not None and abs(node.outputs[0].default_value - value) > 1e-7:
+            node.outputs[0].default_value = value
+            changed = True
+    curve = next((c for c in (material.node_tree.animation_data.drivers if material.node_tree.animation_data else ())
+                  if c.data_path == f'nodes["{FLOOR_LENS}"].outputs[0].default_value'), None)
+    if curve is None:
+        curve = lens.outputs[0].driver_add("default_value")
+        curve.driver.type = "AVERAGE"
+        variable = curve.driver.variables.new()
+        variable.type = "SINGLE_PROP"
+        variable.targets[0].id_type = "CAMERA"
+        changed = True
+    target = curve.driver.variables[0].targets[0]
+    if target.id != data or target.data_path != "lens":
+        target.id, target.data_path = data, "lens"
+        changed = True
+    return changed
+
+
+def floor_sync(obj, plate, scene=None) -> bool:
     """The plane's footage: the node's plate, timed as it plays (its clean floor with it), the
-    material brought up to date first."""
+    material brought up to date first, the camera's lens and sensor in it."""
     material = obj.active_material
     if material is None or material.node_tree is None or plate is None:
         return False
@@ -4776,6 +4900,7 @@ def floor_sync(obj, plate) -> bool:
         ensure_floor_group()
         build_floor_material(material)
         changed = True
+    changed |= floor_camera(material, scene or bpy.context.scene)
     nodes = material.node_tree.nodes
     image = plate.image
     if image is not None and image.size[0]:
@@ -4796,7 +4921,30 @@ def floor_sync(obj, plate) -> bool:
     return changed
 
 
-def floor_footprint(scene):
+def floor_reference(scene):
+    """The object whose XY plane is the floor: the top parent of the scene camera when it's an
+    empty (Jetset's shim origin), else None (the world's Z = 0)."""
+    camera = scene.camera
+    top = camera.parent if camera is not None else None
+    while top is not None and top.parent is not None:
+        top = top.parent
+    return top if top is not None and top.type == "EMPTY" else None
+
+
+def floor_ref_of(settings, scene):
+    """The floor object a node's floor shadows use: the one picked, else the one found."""
+    picked = bpy.data.objects.get(settings.floor_ref) if settings.floor_ref else None
+    return picked if picked is not None else floor_reference(scene)
+
+
+def _to_floor(ref):
+    """World to floor space (the floor object's local space; the world without one)."""
+    from mathutils import Matrix
+
+    return ref.matrix_world.inverted() if ref is not None else Matrix.Identity(4)
+
+
+def floor_footprint(scene, ref=None):
     """The four corners of the camera's view on the floor (Z = 0), the far ones reined in to
     FLOOR_RANGE where the view runs to the horizon. None without a camera above the floor."""
     camera = scene.camera
@@ -4804,7 +4952,7 @@ def floor_footprint(scene):
         return None
     from mathutils import Vector
 
-    matrix = camera.matrix_world
+    matrix = _to_floor(ref) @ camera.matrix_world  # worked out in floor space: the floor is Z = 0
     origin = matrix.translation
     if origin.z <= 0.01:
         return None
@@ -4869,7 +5017,7 @@ def _smallest_rectangle(points, margin: float = 0.0):
     return [(x * c - y * s_, x * s_ + y * c) for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
 
 
-def shot_footprint(scene, every: int | None = None):
+def shot_footprint(scene, every: int | None = None, ref=None):
     """The camera's view of the floor over the whole shot (the scene's frame range): the smallest
     rectangle around every frame's footprint, so the plane covers the floor whatever the camera
     does. None without a camera above the floor."""
@@ -4885,10 +5033,10 @@ def shot_footprint(scene, every: int | None = None):
     try:
         for frame in frames:
             scene.frame_set(frame)
-            corners = floor_footprint(scene)
+            corners = floor_footprint(scene, ref)
             if corners is not None:
                 points += [(round(p.x, 4), round(p.y, 4)) for p in corners]
-                forward += camera_forward(scene)
+                forward += camera_forward(scene, ref)
     finally:
         scene.frame_set(current, subframe=sub)
     rectangle = _smallest_rectangle(points, margin=0.1)
@@ -4897,11 +5045,20 @@ def shot_footprint(scene, every: int | None = None):
     return orient_corners([Vector((x, y, FLOOR_LIFT)) for x, y in rectangle], forward)
 
 
-def camera_forward(scene):
+def place_on_floor(obj, ref) -> None:
+    """Parent the plane to the floor object with no offset, so its mesh is in floor space."""
+    from mathutils import Matrix
+
+    obj.parent = ref
+    obj.matrix_parent_inverse = Matrix.Identity(4)
+    obj.matrix_basis = Matrix.Identity(4)
+
+
+def camera_forward(scene, ref=None):
     """Where the camera looks, flat on the floor (a 2D unit vector; zero looking straight down)."""
     from mathutils import Vector
 
-    look = scene.camera.matrix_world.to_3x3() @ Vector((0.0, 0.0, -1.0))
+    look = (_to_floor(ref) @ scene.camera.matrix_world).to_3x3() @ Vector((0.0, 0.0, -1.0))
     flat = Vector((look.x, look.y))
     return flat.normalized() if flat.length > 1e-6 else flat
 
@@ -5011,9 +5168,10 @@ def sample_floor_colour(node, src, scene, obj):
 def make_floor_shadows(node, src, scene):
     """The plane (covering the floor the camera sees over the whole shot), its material and its
     floor colour. (object, note) or (None, why not)."""
-    corners = shot_footprint(scene)
+    ref = floor_ref_of(node.corridorkey_shader, scene)
+    corners = shot_footprint(scene, ref=ref)
     if corners is None:
-        return None, "Needs the scene camera above the floor (Z = 0)."
+        return None, "Needs the scene camera above the floor."
     plate = wired_image_node(src, 0)
     if plate is None or plate.image is None:
         return None, "Connect the footage first."
@@ -5022,6 +5180,9 @@ def make_floor_shadows(node, src, scene):
     floor_mesh(mesh, corners)
     obj = bpy.data.objects.new(name, mesh)
     obj[FLOOR_TAG] = st(src).uid
+    if ref is not None:  # on the floor object: moves with it (the mesh is in its space)
+        obj.parent = ref
+        node.corridorkey_shader.floor_ref = ref.name
     owner = bpy.context.active_object
     if owner is not None:
         obj[FLOOR_OWNER] = owner.name
@@ -5292,18 +5453,19 @@ class CORRIDORKEY_SHADER_OT_floor_fit(_OnSource, bpy.types.Operator):
     def execute(self, context):
         node, src = node_by_source(self.uid), self.source()
         obj = floor_object(node, src) if node is not None and src is not None else None
+        ref = floor_ref_of(node.corridorkey_shader, context.scene)
         if self.scope == "SHOT":
-            corners = shot_footprint(context.scene)
+            corners = shot_footprint(context.scene, ref=ref)
         else:
-            corners = floor_footprint(context.scene)
-            corners = orient_corners(corners, camera_forward(context.scene)) if corners else None
+            corners = floor_footprint(context.scene, ref)
+            corners = orient_corners(corners, camera_forward(context.scene, ref)) if corners else None
         if obj is None or corners is None:
             self.report({"WARNING"}, "Needs the floor plane and the scene camera above the floor.")
             return {"CANCELLED"}
         if obj.mode == "EDIT":
             bpy.ops.object.mode_set(mode="OBJECT")
-        inverse = obj.matrix_world.inverted()
-        floor_mesh(obj.data, [inverse @ p for p in corners])
+        place_on_floor(obj, ref)
+        floor_mesh(obj.data, corners)
         return {"FINISHED"}
 
 
@@ -5394,6 +5556,7 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     views = {"MATTE": "showing the matte", "FLOOR": "showing the floor", "CLEAN": "showing the clean floor"}
     note = ("baking" if uid in FLOOR_JOBS else views.get(settings.floor_view, "on")) if group is not None else ""
     box = _fold(layout, settings, "ui_floor", "Floor Shadows", "MESH_PLANE", note)
+    draw_floor_setup(box, node, src, scene)
     if group is None:
         _lines(box, "Keep the real shadows on the floor: a see-through plane on the floor that "
                     "darkens what's behind it where the footage is shadowed. It follows the camera "
@@ -5403,7 +5566,7 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         row.operator(CORRIDORKEY_SHADER_OT_floor_add.bl_idname, icon="ADD").uid = uid
         return
     inputs = group.inputs
-    if "Crop Left" not in inputs:  # an older plane: the next sync brings it up to date
+    if "Screen" not in inputs:  # an older plane: the next sync brings it up to date
         box.label(text="Updating the floor plane...", icon="TIME")
         return
 
@@ -5491,6 +5654,196 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     row.label(text=obj.name, icon="OBJECT_DATA")
     row.operator(CORRIDORKEY_SHADER_OT_floor_remove.bl_idname, text="", icon="TRASH").uid = uid
     box.label(text="Sliders can be keyframed (right-click).", icon="KEYFRAME")
+
+
+# --- the footage plane laid onto the floor: where it would go below the floor, its points slide
+# along the camera's sight lines onto the floor (Geometry Nodes). From the camera nothing changes;
+# in the set it rests on the floor instead of passing through it, and stands up again wherever
+# it's above the floor.
+
+BEND_GROUP, BEND_MOD = "CK Lay on Floor", "CK Lay on Floor"
+
+
+def _socket_id(tree, name: str) -> str:
+    return next(i.identifier for i in tree.interface.items_tree
+                if getattr(i, "item_type", "") == "SOCKET" and i.in_out == "INPUT" and i.name == name)
+
+
+def ensure_bend_group():
+    tree = bpy.data.node_groups.get(BEND_GROUP)
+    if tree is not None and tree.get("ck_version") == 2:
+        return tree
+    if tree is None:
+        tree = bpy.data.node_groups.new(BEND_GROUP, "GeometryNodeTree")
+    tree.nodes.clear()
+    tree.interface.clear()
+    tree["ck_version"] = 2
+    if hasattr(tree, "is_modifier"):
+        tree.is_modifier = True
+    face = tree.interface
+    face.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    face.new_socket("Floor", in_out="INPUT", socket_type="NodeSocketObject")
+    face.new_socket("Camera", in_out="INPUT", socket_type="NodeSocketObject")
+    lift = face.new_socket("Lift", in_out="INPUT", socket_type="NodeSocketFloat")
+    lift.default_value, lift.min_value = 0.001, 0.0
+    detail = face.new_socket("Detail", in_out="INPUT", socket_type="NodeSocketInt")
+    detail.default_value, detail.min_value, detail.max_value = 6, 0, 9
+    face.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    nodes, links = tree.nodes, tree.links
+
+    def new(kind, **attrs):
+        n = nodes.new(kind)
+        for key, value in attrs.items():
+            setattr(n, key, value)
+        return n
+
+    def vec(op, a, b=None, scale=None):
+        n = new("ShaderNodeVectorMath", operation=op)
+        _feed(links, n.inputs[0], a)
+        if b is not None:
+            _feed(links, n.inputs[1], b)
+        if scale is not None:
+            _feed(links, n.inputs["Scale"], scale)
+        return n.outputs["Value" if op == "DOT_PRODUCT" else "Vector"]
+
+    def num(op, a, b):
+        n = new("ShaderNodeMath", operation=op)
+        _feed(links, n.inputs[0], a)
+        _feed(links, n.inputs[1], b)
+        return n.outputs[0]
+
+    def less(a, b):
+        n = new("FunctionNodeCompare", data_type="FLOAT", operation="LESS_THAN")
+        _feed(links, n.inputs["A"], a)
+        _feed(links, n.inputs["B"], b)
+        return n.outputs["Result"]
+
+    group_in, group_out = new("NodeGroupInput"), new("NodeGroupOutput")
+    sub = new("GeometryNodeSubdivideMesh")
+    links.new(group_in.outputs["Geometry"], sub.inputs["Mesh"])
+    links.new(group_in.outputs["Detail"], sub.inputs["Level"])
+    # worked out in world space (the footage plane is often scaled), then back to the plane's own
+    floor = new("GeometryNodeObjectInfo", transform_space="ORIGINAL")
+    links.new(group_in.outputs["Floor"], floor.inputs["Object"])
+    camera = new("GeometryNodeObjectInfo", transform_space="ORIGINAL")
+    links.new(group_in.outputs["Camera"], camera.inputs["Object"])
+    me = new("GeometryNodeObjectInfo", transform_space="ORIGINAL")
+    links.new(new("GeometryNodeSelfObject").outputs[0], me.inputs["Object"])
+    back = new("FunctionNodeInvertMatrix")
+    links.new(me.outputs["Transform"], back.inputs["Matrix"])
+
+    def transform(point, matrix):
+        n = new("FunctionNodeTransformPoint")
+        _feed(links, n.inputs["Vector"], point)
+        links.new(matrix, n.inputs["Transform"])
+        return n.outputs[0]
+
+    up = new("FunctionNodeRotateVector")
+    up.inputs["Vector"].default_value = (0.0, 0.0, 1.0)
+    links.new(floor.outputs["Rotation"], up.inputs["Rotation"])
+    normal = vec("NORMALIZE", up.outputs[0])
+    floor_point = vec("ADD", floor.outputs["Location"], vec("SCALE", normal, scale=group_in.outputs["Lift"]))
+    position = transform(new("GeometryNodeInputPosition").outputs[0], me.outputs["Transform"])
+    eye = camera.outputs["Location"]
+    height = vec("DOT_PRODUCT", vec("SUBTRACT", position, floor_point), normal)
+    ray = vec("SUBTRACT", position, eye)
+    toward = vec("DOT_PRODUCT", ray, normal)
+    reach = num("DIVIDE", vec("DOT_PRODUCT", vec("SUBTRACT", floor_point, eye), normal), toward)
+    landed = vec("ADD", eye, vec("SCALE", ray, scale=reach))
+    both = new("FunctionNodeBooleanMath", operation="AND")
+    links.new(less(height, 0.0), both.inputs[0])
+    links.new(less(toward, -1e-6), both.inputs[1])  # the sight line heads down to the floor
+    place = new("GeometryNodeSetPosition")
+    links.new(sub.outputs["Mesh"], place.inputs["Geometry"])
+    links.new(both.outputs[0], place.inputs["Selection"])
+    links.new(transform(landed, back.outputs["Matrix"]), place.inputs["Position"])
+    links.new(place.outputs["Geometry"], group_out.inputs["Geometry"])
+    return tree
+
+
+def footage_objects(node):
+    """The objects showing this CorridorKey node's material."""
+    tree = node.id_data
+    return [o for o in bpy.data.objects if o.type == "MESH" and any(
+        s.material is not None and s.material.node_tree == tree for s in o.material_slots)]
+
+
+def bend_modifier(obj):
+    return next((m for m in obj.modifiers if m.type == "NODES" and m.node_group is not None
+                 and m.node_group.name.startswith(BEND_GROUP)), None)
+
+
+def _node_of_settings(settings):
+    pointer = settings.as_pointer()
+    return next((n for n in shader_nodes() if n.corridorkey_shader.as_pointer() == pointer), None)
+
+
+def _bend_settings(settings) -> None:
+    node = _node_of_settings(settings)
+    if node is None:
+        return
+    for obj in footage_objects(node):
+        modifier = bend_modifier(obj)
+        if modifier is not None:
+            tree = modifier.node_group
+            modifier[_socket_id(tree, "Lift")] = settings.bend_lift
+            modifier[_socket_id(tree, "Detail")] = settings.bend_detail
+            obj.update_tag()
+
+
+class CORRIDORKEY_SHADER_OT_floor_bend(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_bend"
+    bl_label = "Lay Footage on Floor"
+    bl_description = (
+        "Where the footage plane would go below the floor, lay that part onto the floor along the "
+        "camera's sight lines: the camera sees the same picture, but in the set it rests on the "
+        "floor instead of passing through it. Click again to turn it off"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        node = node_by_source(self.uid)
+        if node is None:
+            return {"CANCELLED"}
+        settings = node.corridorkey_shader
+        objects = footage_objects(node)
+        if any(bend_modifier(o) is not None for o in objects):
+            for obj in objects:
+                modifier = bend_modifier(obj)
+                if modifier is not None:
+                    obj.modifiers.remove(modifier)
+            return {"FINISHED"}
+        ref = floor_ref_of(settings, context.scene)
+        if ref is None or context.scene.camera is None:
+            self.report({"WARNING"}, "Pick the floor object (Jetset's shim origin) first.")
+            return {"CANCELLED"}
+        tree = ensure_bend_group()
+        for obj in objects:
+            modifier = obj.modifiers.new(BEND_MOD, "NODES")
+            modifier.node_group = tree
+            modifier[_socket_id(tree, "Floor")] = ref
+            modifier[_socket_id(tree, "Camera")] = context.scene.camera
+            modifier[_socket_id(tree, "Lift")] = settings.bend_lift
+            modifier[_socket_id(tree, "Detail")] = settings.bend_detail
+            obj.update_tag()
+        return {"FINISHED"}
+
+
+def draw_floor_setup(box, node, src, scene) -> None:
+    """The floor object, and laying the footage plane on it."""
+    uid, settings = st(src).uid, node.corridorkey_shader
+    row = box.row(align=True)
+    row.prop_search(settings, "floor_ref", bpy.data, "objects", text="Floor", icon="EMPTY_AXIS")
+    if not settings.floor_ref:
+        found = floor_reference(scene)
+        box.label(text=f"Using {found.name}" if found else "Using the world's Z = 0", icon="BLANK1")
+    laid = any(bend_modifier(o) is not None for o in footage_objects(node))
+    row = box.row(align=True)
+    row.operator(CORRIDORKEY_SHADER_OT_floor_bend.bl_idname, icon="MOD_SIMPLEDEFORM", depress=laid).uid = uid
+    if laid:
+        row = box.row(align=True)
+        row.prop(settings, "bend_lift")
+        row.prop(settings, "bend_detail")
 
 
 def _paid_op(name: str) -> str | None:
@@ -6403,6 +6756,7 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_floor_fit,
     CORRIDORKEY_SHADER_OT_floor_sample,
     CORRIDORKEY_SHADER_OT_floor_edit,
+    CORRIDORKEY_SHADER_OT_floor_bend,
     CORRIDORKEY_SHADER_OT_floor_remove,
     CORRIDORKEY_SHADER_OT_floor_bake,
     CORRIDORKEY_SHADER_OT_floor_bake_cancel,
