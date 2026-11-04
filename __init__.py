@@ -675,6 +675,12 @@ def shown_frames(src: bpy.types.Node, frame: int | None = None) -> bpy.types.Nod
     return wired_image_node(src, 0)
 
 
+def baked_at(src: bpy.types.Node, frame: int) -> bool:
+    """Whether this frame shows the rendered (baked) key: then F12 has nothing to key."""
+    shown = shown_frames(src, frame)
+    return shown is not None and shown.name == RESULT
+
+
 def _set(owner, attr: str, value) -> bool:
     if getattr(owner, attr) != value:
         setattr(owner, attr, value)
@@ -2801,7 +2807,7 @@ class CORRIDORKEY_SHADER_OT_render_image(bpy.types.Operator):
     bl_label = f"Render Image ({NAME})"
     bl_description = (
         "Key the frame you're on with CorridorKey first (or reuse its cached preview), "
-        "then render it. Esc while it keys cancels"
+        "then render it. A frame showing the rendered key is used as it is. Esc while it keys cancels"
     )
 
     def _plain_render(self):
@@ -2820,7 +2826,7 @@ class CORRIDORKEY_SHADER_OT_render_image(bpy.types.Operator):
         self.queue, self.started, self.notes = [], set(), []
         for node in scene_nodes(scene):
             src = source_of(node)
-            if src is None:
+            if src is None or baked_at(src, self.frame):  # the rendered key is already there
                 continue
             key, _why = preview_key(src, scene, self.frame)
             if key is not None and st(src).uid not in self.queue:
@@ -6038,7 +6044,12 @@ def draw_render(layout, node, src, scene) -> None:
     elif _paid_op("render"):
         row.operator(_paid_op("render"), text="Render Shot", icon="RENDER_ANIMATION").node_uid = uid
 
-    box.prop(scene, "corridorkey_key_before_render", text="Key the Frame Before F12")
+    row = box.row()
+    if baked_at(src, scene.frame_current):  # the rendered key is shown here: nothing to key
+        row.enabled = False
+        row.prop(scene, "corridorkey_key_before_render", text="Key Before F12: rendered key used")
+    else:
+        row.prop(scene, "corridorkey_key_before_render", text="Key the Frame Before F12")
     row = box.row()
     row.enabled = not shot_job
     row.prop(state, "display_rendered_frames", text="Show the Rendered Key")
@@ -6965,7 +6976,8 @@ def register() -> None:
         name="Key Frame Before F12 Render",
         description=(
             "When you render an image (F12), key the current frame with CorridorKey first, "
-            "or use its cached preview, so the render has a fresh key"
+            "or use its cached preview, so the render has a fresh key. Not needed (and skipped) "
+            "on frames that show the rendered key"
         ),
         default=True,
     )
