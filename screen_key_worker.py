@@ -97,7 +97,7 @@ def write_grey_png(path: str, matte_bottom_up: np.ndarray) -> None:
 
 
 def clean_floor(linear: np.ndarray, shown: np.ndarray, colour, direction, degree: int = 3,
-                columns: int = 160) -> np.ndarray:
+                columns: int = 160, reject: float = 0.93) -> np.ndarray:
     """How bright the floor is where nothing shades it, as a multiple of the floor colour, over a
     coarse grid (`columns` wide). Each block's floor brightness (its screen-hued pixels' share of
     the floor colour) is fitted with a smooth surface (a polynomial of `degree` in x and y), again
@@ -126,7 +126,7 @@ def clean_floor(linear: np.ndarray, shown: np.ndarray, colour, direction, degree
     for _round in range(6):
         coeffs, *_ = np.linalg.lstsq(basis[keep], flat[keep], rcond=None)
         fit = basis @ coeffs
-        keep = known.ravel() & (flat > fit * 0.93)  # shadow blocks drop out of the next fit
+        keep = known.ravel() & (flat > fit * reject)  # shadow blocks drop out of the next fit
         if keep.sum() < len(terms) * 4:
             break
     # the floor's own variation sits about the fit: lift it to the unshadowed blocks' upper side
@@ -204,7 +204,8 @@ def clean_floor_frames(request: dict, start: int, step: int) -> None:
             linear = _srgb_to_linear(rgb) if display else np.clip(rgb, 0.0, None)
             shown = rgb if display else to_display(rgb)
             level = clean_floor(linear, shown, request["colour"], request["direction"],
-                                int(request.get("degree", 3)), int(request.get("columns", 160)))
+                                int(request.get("degree", 3)), int(request.get("columns", 160)),
+                                float(request.get("reject", 0.93)))
             write_grey_png(target, level / 2.0)
     except Exception as exc:  # the add-on shows this line
         with open(os.path.join(out_dir, f"error_{start}.txt"), "w", encoding="utf-8") as f:
