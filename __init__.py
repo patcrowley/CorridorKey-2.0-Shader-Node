@@ -2552,15 +2552,14 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
                ("CLEAN", "Clean", "The baked clean floor's brightness")],
         default="RESULT", update=_floor_view_changed,
     )
-    floor_fit_degree: bpy.props.IntProperty(
-        name="Fit Detail", min=1, max=5, default=3,
-        description="How much detail the clean-floor fit follows: 1 a flat ramp, 5 bumpy lighting. "
-                    "Too much and it starts to follow big shadows too",
+    floor_shadow_time: bpy.props.FloatProperty(
+        name="Shadow Time", min=0.0, max=0.95, default=0.8, subtype="FACTOR",
+        description="How much of the shot a spot on the floor may spend in shadow and still be "
+                    "measured clean. Raise it if the actor lingers in one place",
     )
-    floor_fit_reject: bpy.props.FloatProperty(
-        name="Shadow Cut", min=0.5, max=0.99, default=0.93,
-        description="Floor darker than this share of the fit counts as shadow and is left out of the "
-                    "next fit. Lower it if the lighting is patchy, raise it for faint shadows",
+    floor_clean_softness: bpy.props.FloatProperty(
+        name="Softness", min=0.0, max=2.0, default=0.15, unit="LENGTH",
+        description="How far the clean floor is smoothed on the floor (grain and small specks out)",
     )
     ui_floor_matte: bpy.props.BoolProperty(name="Matte", default=True)
     ui_floor_detect: bpy.props.BoolProperty(name="Floor Detection", default=False)
@@ -4685,7 +4684,7 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
               (0.866, -0.5),
 ]
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
-FLOOR_MATERIAL_VERSION = 3
+FLOOR_MATERIAL_VERSION = 4
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4697,6 +4696,8 @@ def build_floor_material(material) -> None:
     nodes, links = tree.nodes, tree.links
     group = nodes.get(FLOOR_NODE)
     clean = nodes.get(FLOOR_CLEAN)
+    if clean is not None and clean.image is not None and clean.image.source != "FILE":
+        clean.image = None  # an older, per-frame bake (in the camera's frame): it no longer fits
     baked = clean is not None and clean.image is not None
     for n in list(nodes):
         if n not in (group, clean):
@@ -4770,7 +4771,8 @@ def build_floor_material(material) -> None:
     links.new(axes[0], framed.inputs[0])
     links.new(axes[1], framed.inputs[1])
     screen = framed.outputs[0]
-    links.new(screen, clean.inputs["Vector"])
+    # the clean floor lies on the floor (the plane's UVs), measured over the whole shot
+    links.new(coords.outputs["UV"], clean.inputs["Vector"])
     links.new(screen, group.inputs["Screen"])
     if baked:
         links.new(clean.outputs["Color"], group.inputs["Clean Floor"])
@@ -4846,15 +4848,10 @@ def floor_group_node(obj):
     return tree.nodes.get(FLOOR_NODE) if tree is not None else None
 
 
-def floor_camera(material, scene) -> bool:
-    """The camera's numbers in the plane's material: its lens (driven, so a zoom is followed),
-    and its sensor, shift and the render's shape (set here)."""
-    camera = scene.camera if scene is not None else None
-    nodes = material.node_tree.nodes
-    lens = nodes.get(FLOOR_LENS)
-    if camera is None or camera.type != "CAMERA" or lens is None:
-        return False
-    data, render = camera.data, scene.render
+def camera_factors(scene):
+    """The scene camera's projection, as the floor material does it: a point (x, y, z) in camera
+    space lands at x * lens * kx / -z + 0.5 + sx across the frame (0-1), y alike. (kx, ky, sx, sy)."""
+    data, render = scene.camera.data, scene.render
     rx = render.resolution_x * render.pixel_aspect_x
     ry = render.resolution_y * render.pixel_aspect_y
     across = data.sensor_fit == "HORIZONTAL" or (data.sensor_fit == "AUTO" and rx >= ry)
@@ -4866,8 +4863,20 @@ def floor_camera(material, scene) -> bool:
         ky = 1.0 / sensor
         kx = ky * ry / rx
     big = max(rx, ry)
+    return kx, ky, -data.shift_x * big / rx, -data.shift_y * big / ry
+
+
+def floor_camera(material, scene) -> bool:
+    """The camera's numbers in the plane's material: its lens (driven, so a zoom is followed),
+    and its sensor, shift and the render's shape (set here)."""
+    camera = scene.camera if scene is not None else None
+    nodes = material.node_tree.nodes
+    lens = nodes.get(FLOOR_LENS)
+    if camera is None or camera.type != "CAMERA" or lens is None:
+        return False
+    data = camera.data
     changed = False
-    for name, value in zip(FLOOR_FACTORS, (kx, ky, -data.shift_x * big / rx, -data.shift_y * big / ry)):
+    for name, value in zip(FLOOR_FACTORS, camera_factors(scene)):
         node = nodes.get(name)
         if node is not None and abs(node.outputs[0].default_value - value) > 1e-7:
             node.outputs[0].default_value = value
@@ -4908,10 +4917,9 @@ def floor_sync(obj, plate, scene=None) -> bool:
         if aspect is not None:
             changed |= _set(aspect.outputs[0], "default_value", image.size[1] / image.size[0])
     for node in nodes:
-        if node.bl_idname != "ShaderNodeTexImage" or not node.name.startswith((FLOOR_TEX, FLOOR_CLEAN)):
+        if node.bl_idname != "ShaderNodeTexImage" or not node.name.startswith(FLOOR_TEX):
             continue
-        if node.name.startswith(FLOOR_TEX):
-            changed |= _set(node, "image", image)
+        changed |= _set(node, "image", image)
         if node.image is not None and image is not None:
             user = node.image_user
             for attr in ("frame_start", "frame_offset", "frame_duration"):
@@ -5225,9 +5233,39 @@ def _hue_of(colour_linear) -> list[float]:
     return [c / length for c in chroma]
 
 
+FLOOR_TEXELS = 320  # the clean floor's texels along the plane's longer side
+
+
+def floor_uv_frame(obj):
+    """The plane's UV square in its own space: (corner at UV 0,0; the edge to UV 1,0; the edge
+    to UV 0,1), or None."""
+    mesh = obj.data
+    layer = mesh.uv_layers.active
+    if layer is None:
+        return None
+    at = {}
+    for loop in mesh.loops:
+        uv = layer.data[loop.index].uv
+        at[(round(uv.x), round(uv.y))] = mesh.vertices[loop.vertex_index].co.copy()
+    if not all(k in at for k in ((0, 0), (1, 0), (0, 1))):
+        return None
+    return at[(0, 0)], at[(1, 0)] - at[(0, 0)], at[(0, 1)] - at[(0, 0)]
+
+
+def _launch(script: str, request: dict, path: str) -> subprocess.Popen:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(request, f)
+    return subprocess.Popen(
+        [bpy.app.binary_path, "-b", "--factory-startup", "--python", script, "--", path],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=0x08000000 if sys.platform == "win32" else 0,
+    )
+
+
 def start_floor_bake(node, src, scene) -> str | None:
-    """Bake the clean floor for every frame, in background Blenders: how bright the unshadowed
-    floor is across the frame, so the lighting's falloff isn't taken for shadow."""
+    """Bake the clean floor, in background Blenders: every frame is looked at from the floor (the
+    camera's view of each spot), and each spot keeps the brightness it has when it isn't shadowed.
+    Shadows move with the actor; the lighting stays put on the floor, so it's what's left."""
     uid = st(src).uid
     if uid in FLOOR_JOBS:
         return None
@@ -5239,11 +5277,34 @@ def start_floor_bake(node, src, scene) -> str | None:
     image = plate.image if plate is not None else None
     if image is None or image.source != "SEQUENCE":
         return "The clean floor bakes from an image sequence (not a movie)."
+    if scene.camera is None or scene.camera.type != "CAMERA":
+        return "Needs the scene camera."
+    square = floor_uv_frame(obj)
+    if square is None:
+        return "The floor plane has no UVs: remove it and add Floor Shadows again."
     folder = os.path.dirname(bpy.path.abspath(image.filepath, library=image.library))
     plates = numbered(folder)
-    if not plates:
-        return "No footage frames found."
-    numbers = sorted(plates)
+    # the shot's frames, each with its plate file (as the footage node shows it)
+    frames = []
+    for frame in range(scene.frame_start, scene.frame_end + 1):
+        number = frame - plate.frame_start + 1 + plate.frame_offset
+        if number in plates:
+            frames.append((frame, number))
+    if not frames:
+        return "No footage frames found for the scene's frame range."
+    origin, across, along = square
+    texel = max(across.length, along.length) / FLOOR_TEXELS
+    size = [max(8, round(across.length / texel)), max(8, round(along.length / texel))]
+    current, sub = scene.frame_current, scene.frame_subframe
+    jobs = []
+    try:
+        for frame, number in frames:
+            scene.frame_set(frame)
+            matrix = scene.camera.matrix_world.inverted() @ obj.matrix_world
+            view = [v for row in matrix for v in row] + [scene.camera.data.lens, *camera_factors(scene)]
+            jobs.append([number, os.path.join(folder, plates[number]), view])
+    finally:
+        scene.frame_set(current, subframe=sub)
     root = bpy.path.abspath("//CorridorKey/Floor") if bpy.data.filepath else os.path.join(
         tempfile.gettempdir(), "CorridorKey Floor")
     os.makedirs(root, exist_ok=True)
@@ -5253,33 +5314,28 @@ def start_floor_bake(node, src, scene) -> str | None:
     work = os.path.join(tempfile.gettempdir(), "CorridorKey Floor", uuid.uuid4().hex[:8])
     os.makedirs(work)
     colour = list(group.inputs["Floor Colour"].default_value)[:3]
+    settings = node.corridorkey_shader
+    request = {
+        "mode": "clean_floor", "frames": jobs, "colour": colour, "direction": _hue_of(colour),
+        "grid": [list(origin), list(across), list(along)], "size": size,
+        "out_dir": out_dir, "work": work,
+        "shadow_time": settings.floor_shadow_time, "softness": settings.floor_clean_softness / texel,
+    }
     workers = max(1, min(4, (os.cpu_count() or 4) // 4))
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "screen_key_worker.py")
-    flags = 0x08000000 if sys.platform == "win32" else 0
     processes = []
     for index in range(workers):
-        request = {
-            "mode": "clean_floor", "frames": [[n, os.path.join(folder, plates[n]), None] for n in numbers],
-            "colour": colour, "direction": _hue_of(colour), "out_dir": out_dir, "prefix": "clean_",
-            "degree": node.corridorkey_shader.floor_fit_degree, "reject": node.corridorkey_shader.floor_fit_reject,
-            "slice": [index, workers],
-        }
-        path = os.path.join(work, f"request_{index}.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(request, f)
         try:
-            processes.append(subprocess.Popen(
-                [bpy.app.binary_path, "-b", "--factory-startup", "--python", script, "--", path],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                creationflags=flags,
-            ))
+            processes.append(_launch(script, {**request, "slice": [index, workers]},
+                                     os.path.join(work, f"request_{index}.json")))
         except OSError as exc:
             for process in processes:
                 process.kill()
             shutil.rmtree(work, ignore_errors=True)
             return f"The clean-floor bake didn't start: {exc}"
-    FLOOR_JOBS[uid] = {"processes": processes, "work": work, "out_dir": out_dir, "total": len(numbers),
-                       "object": obj.name, "started": time.monotonic()}
+    FLOOR_JOBS[uid] = {"processes": processes, "work": work, "out_dir": out_dir, "total": len(jobs),
+                       "object": obj.name, "started": time.monotonic(), "request": request,
+                       "script": script, "phase": "sample"}
     PREVIEW_LINE["floor:" + uid] = "Baking the clean floor..."
     return None
 
@@ -5295,8 +5351,9 @@ def cancel_floor_bake(uid: str) -> None:
                 pass
 
 
-def plug_clean_floor(obj, out_dir: str, plate) -> bool:
-    """A finished clean-floor bake into the plane's material (or out of it, with no folder)."""
+def plug_clean_floor(obj, path: str) -> bool:
+    """A finished clean-floor bake (one image over the plane's UVs) into the plane's material, or
+    out of it (no path)."""
     material = obj.active_material if obj is not None else None
     tree = material.node_tree if material is not None else None
     group = tree.nodes.get(FLOOR_NODE) if tree is not None else None
@@ -5305,63 +5362,79 @@ def plug_clean_floor(obj, out_dir: str, plate) -> bool:
         return False
     for link in list(group.inputs["Clean Floor"].links):
         tree.links.remove(link)
-    if not out_dir:
+    if not path:
         clean.image = None
         return True
-    names = sorted(f for f in os.listdir(out_dir) if f.endswith(".png"))
-    if not names:
+    if not os.path.isfile(path):
         return False
-    path = os.path.join(out_dir, names[0])
     if bpy.data.filepath:
         try:
             path = bpy.path.relpath(path)
         except ValueError:
             pass
     image = bpy.data.images.load(path, check_existing=False)
-    image.source = "SEQUENCE"
     image.colorspace_settings.name = "Non-Color"
     image.name = f"Clean floor ({obj.name})"
     clean.image = image
     tree.links.new(clean.outputs["Color"], group.inputs["Clean Floor"])
-    if plate is not None:
-        floor_sync(obj, plate)
     return True
 
 
+def _floor_error(folder: str) -> str:
+    message = ""
+    for name in sorted(f for f in os.listdir(folder) if f.startswith("error_")) if os.path.isdir(folder) else []:
+        with open(os.path.join(folder, name), encoding="utf-8", errors="replace") as f:
+            message = message or f.read().strip()[:160]
+    return message
+
+
 def land_floor_bakes() -> bool:
-    """Clean-floor bakes: how far along; the finished ones plugged into their plane."""
+    """Clean-floor bakes: how far along; the sampled ones combined; the finished ones plugged
+    into their plane."""
     changed = False
     for uid, job in list(FLOOR_JOBS.items()):
-        try:
-            done = len([f for f in os.listdir(job["out_dir"]) if f.endswith(".png")])
-        except OSError:
+        work = job["work"]
+        running = any(process.poll() is None for process in job["processes"])
+        if job["phase"] == "sample":
             done = 0
-        if any(process.poll() is None for process in job["processes"]):
-            line = f"Baking the clean floor: {done} of {job['total']} frames"
-            if PREVIEW_LINE.get("floor:" + uid) != line:
-                PREVIEW_LINE["floor:" + uid] = line
-                changed = True
+            for index in range(len(job["processes"])):
+                try:
+                    with open(os.path.join(work, f"progress_{index}.txt")) as f:
+                        done += int(f.read().strip() or 0)
+                except (OSError, ValueError):
+                    pass
+            if running:
+                line = f"Baking the clean floor: {done} of {job['total']} frames"
+                if PREVIEW_LINE.get("floor:" + uid) != line:
+                    PREVIEW_LINE["floor:" + uid] = line
+                    changed = True
+                continue
+            if not job.get("cancelled") and done >= job["total"] and not _floor_error(work):
+                try:  # every frame looked at: combine them (a few seconds)
+                    job["processes"] = [_launch(job["script"], {**job["request"], "mode": "clean_floor_combine"},
+                                                os.path.join(work, "request_combine.json"))]
+                    job["phase"] = "combine"
+                    PREVIEW_LINE["floor:" + uid] = "Baking the clean floor: putting the frames together"
+                    changed = True
+                    continue
+                except OSError:
+                    pass
+        elif running:
             continue
         del FLOOR_JOBS[uid]
         changed = True
-        shutil.rmtree(job["work"], ignore_errors=True)
-        errors = sorted(f for f in os.listdir(job["out_dir"]) if f.startswith("error_")) if os.path.isdir(job["out_dir"]) else []
-        message = ""
-        for name in errors:
-            with open(os.path.join(job["out_dir"], name), encoding="utf-8", errors="replace") as f:
-                message = message or f.read().strip()[:160]
-            os.remove(os.path.join(job["out_dir"], name))
+        message = _floor_error(work)
+        shutil.rmtree(work, ignore_errors=True)
         obj = bpy.data.objects.get(job["object"])
-        src = node_by_uid(uid)
+        result = os.path.join(job["out_dir"], "clean_floor.png")
         if job.get("cancelled"):
             PREVIEW_LINE["floor:" + uid] = "Clean-floor bake stopped."
-        elif done < job["total"] or obj is None:
-            PREVIEW_LINE["floor:" + uid] = f"Clean-floor bake stopped at {done} of {job['total']} frames" + (
-                f": {message}" if message else ".")
+        elif obj is None or not os.path.isfile(result):
+            PREVIEW_LINE["floor:" + uid] = "Clean-floor bake stopped" + (f": {message}" if message else ".")
         else:
-            plug_clean_floor(obj, job["out_dir"], wired_image_node(src, 0) if src is not None else None)
+            plug_clean_floor(obj, result)
             seconds = int(time.monotonic() - job["started"])
-            PREVIEW_LINE["floor:" + uid] = (f"Clean floor baked: {done} frames in {seconds // 60}m "
+            PREVIEW_LINE["floor:" + uid] = (f"Clean floor baked from {job['total']} frames in {seconds // 60}m "
                                             f"{seconds % 60:02d}s. Falloff no longer reads as shadow.")
     return changed
 
@@ -5407,7 +5480,7 @@ class CORRIDORKEY_SHADER_OT_floor_unbake(_OnSource, bpy.types.Operator):
         obj = floor_object(node, src) if node is not None and src is not None else None
         if obj is None:
             return {"CANCELLED"}
-        plug_clean_floor(obj, "", None)
+        plug_clean_floor(obj, "")
         return {"FINISHED"}
 
 
@@ -5594,8 +5667,8 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         if baked:
             row.operator(CORRIDORKEY_SHADER_OT_floor_unbake.bl_idname, text="", icon="X").uid = uid
     row = clean.row(align=True)
-    row.prop(settings, "floor_fit_degree")
-    row.prop(settings, "floor_fit_reject", slider=True)
+    row.prop(settings, "floor_shadow_time", slider=True)
+    row.prop(settings, "floor_clean_softness")
     if not baked and uid not in FLOOR_JOBS:
         clean.label(text="Uneven lighting reads as shadow until you bake.", icon="INFO")
 

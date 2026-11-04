@@ -79,9 +79,10 @@ def fit(matte: np.ndarray, height: int, width: int) -> np.ndarray:
     return matte[rows][:, cols]
 
 
-def write_grey_png(path: str, matte_bottom_up: np.ndarray) -> None:
-    """An 8-bit greyscale PNG (the rows of a Blender image run bottom to top)."""
-    grey = (np.clip(matte_bottom_up[::-1], 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+def write_grey_png(path: str, matte_bottom_up: np.ndarray, depth: int = 8) -> None:
+    """A greyscale PNG, 8 or 16 bits (the rows of a Blender image run bottom to top)."""
+    top = 65535.0 if depth == 16 else 255.0
+    grey = (np.clip(matte_bottom_up[::-1], 0.0, 1.0) * top + 0.5).astype(">u2" if depth == 16 else np.uint8)
     height, width = grey.shape
     raw = b"".join(b"\x00" + grey[y].tobytes() for y in range(height))
 
@@ -90,49 +91,100 @@ def write_grey_png(path: str, matte_bottom_up: np.ndarray) -> None:
 
     with open(path + ".part", "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)))
+        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, depth, 0, 0, 0, 0)))
         f.write(chunk(b"IDAT", zlib.compress(raw, 6)))
         f.write(chunk(b"IEND", b""))
     os.replace(path + ".part", path)  # only whole frames ever appear under their name
 
 
-def clean_floor(linear: np.ndarray, shown: np.ndarray, colour, direction, degree: int = 3,
-                columns: int = 160, reject: float = 0.93) -> np.ndarray:
-    """How bright the floor is where nothing shades it, as a multiple of the floor colour, over a
-    coarse grid (`columns` wide). Each block's floor brightness (its screen-hued pixels' share of
-    the floor colour) is fitted with a smooth surface (a polynomial of `degree` in x and y), again
-    and again without the blocks well below it: shadows are dips the fit learns to ignore, the
-    lighting's falloff is what it keeps. Rows run as the input's."""
-    colour = np.asarray(colour, dtype=np.float64)
-    height, width = linear.shape[:2]
-    block = max(1, width // columns)
-    rows, cols = height // block, width // block
-    linear = linear[: rows * block, : cols * block, :3]
-    shown = shown[: rows * block, : cols * block, :3]
-    share = (linear @ colour) / max(float(colour @ colour), 1e-9)
-    floor = (shown @ np.asarray(direction, dtype=np.float64)) > 0.06
-    total = np.where(floor, share, 0.0).reshape(rows, block, cols, block).sum(axis=(1, 3))
-    count = floor.reshape(rows, block, cols, block).sum(axis=(1, 3))
-    known = count > block * block * 0.5
-    level = total / np.maximum(count, 1)
-    ys, xs = np.mgrid[0:rows, 0:cols]
-    u, v = (xs + 0.5) / cols * 2 - 1, (ys + 0.5) / rows * 2 - 1
-    terms = [u ** i * v ** j for i in range(degree + 1) for j in range(degree + 1 - i)]
-    basis = np.stack([t.ravel() for t in terms], axis=1)
-    flat, keep = level.ravel(), known.ravel().copy()
-    if keep.sum() < len(terms) * 4:  # too little floor to fit: the floor colour itself
+CLEAN_BINS = 256  # the clean floor's histogram: share of the floor colour, 0-2 in 256 steps
+
+
+def floor_grid(origin, across, along, size):
+    """The floor texels' centres in the plane's own space: (rows = along, cols = across, 4)."""
+    cols, rows = size
+    u = (np.arange(cols) + 0.5) / cols
+    v = (np.arange(rows) + 0.5) / rows
+    points = (np.asarray(origin, np.float64)[None, None, :] + u[None, :, None] * np.asarray(across, np.float64)
+              + v[:, None, None] * np.asarray(along, np.float64))
+    return np.concatenate([points, np.ones((rows, cols, 1))], axis=2)
+
+
+def floor_samples(rgb: np.ndarray, display: bool, grid: np.ndarray, view, colour, direction):
+    """One frame seen from the floor: for each texel, the floor's brightness there as a share of
+    the floor colour, and whether it's measurable (in frame, in front, the screen's hue: not the
+    actor or the set). `view`: plane-to-camera matrix (16, row-major), lens, kx, ky, sx, sy."""
+    matrix = np.asarray(view[:16], np.float64).reshape(4, 4)
+    lens, kx, ky, sx, sy = view[16:21]
+    camera = grid.reshape(-1, 4) @ matrix.T
+    depth = -camera[:, 2]
+    ahead = depth > 1e-3
+    depth = np.maximum(depth, 1e-3)
+    u = camera[:, 0] * lens * kx / depth + 0.5 + sx
+    v = camera[:, 1] * lens * ky / depth + 0.5 + sy
+    inside = ahead & (u >= 0) & (u < 1) & (v >= 0) & (v < 1)
+    height, width = rgb.shape[:2]
+    px = np.clip((u * width).astype(np.int64), 0, width - 1)
+    py = np.clip((v * height).astype(np.int64), 0, height - 1)  # rows run bottom to top, as v
+    seen = rgb[py, px, :3].astype(np.float64)
+    if display:
+        linear, shown = np.where(seen <= 0.04045, seen / 12.92, ((seen + 0.055) / 1.055) ** 2.4), seen
+    else:
+        linear = np.clip(seen, 0.0, None)
+        shown = to_display(linear)
+    colour = np.asarray(colour, np.float64)
+    share = linear @ colour / max(float(colour @ colour), 1e-9)
+    floor = (shown @ np.asarray(direction, np.float64)) > 0.06
+    return share, inside & floor
+
+
+def add_to_histogram(histogram: np.ndarray, share: np.ndarray, valid: np.ndarray) -> None:
+    bins = histogram.shape[1]
+    index = np.clip((share * (bins / 2.0)).astype(np.int64), 0, bins - 1)
+    texels = np.nonzero(valid)[0]
+    histogram += np.bincount(texels * bins + index[texels], minlength=histogram.size).reshape(histogram.shape).astype(histogram.dtype)
+
+
+def _blur(values: np.ndarray, radius: float) -> np.ndarray:
+    """A Gaussian blur (radius in texels), edges kept (each side renormalised)."""
+    if radius < 0.5:
+        return values
+    out = values
+    for axis in (0, 1):
+        n = out.shape[axis]
+        x = np.arange(n)
+        kernel = np.exp(-0.5 * ((x[:, None] - x[None, :]) / radius) ** 2)
+        kernel /= kernel.sum(axis=1, keepdims=True)
+        out = kernel @ out if axis == 0 else out @ kernel.T
+    return out
+
+
+def clean_floor_level(histogram: np.ndarray, size, shadow_time: float, softness: float) -> np.ndarray:
+    """The clean floor from every frame's samples: per texel, the middle of its brightness once
+    the darkest `shadow_time` share of the frames it was seen in is set aside (shadows move on,
+    the lighting stays), blurred over `softness` texels; texels never seen take their
+    surroundings' level. (rows, cols), a share of the floor colour."""
+    cols, rows = size
+    bins = histogram.shape[1]
+    counts = histogram.sum(axis=1)
+    target = (shadow_time + (1.0 - shadow_time) * 0.5) * counts
+    running = np.cumsum(histogram, axis=1)
+    index = np.argmax(running >= np.maximum(target, 1)[:, None], axis=1)
+    below = np.where(index > 0, running[np.arange(len(index)), index - 1], 0)
+    inside = histogram[np.arange(len(index)), index]
+    within = np.clip((target - below) / np.maximum(inside, 1), 0.0, 1.0)
+    level = ((index + within) * (2.0 / bins)).reshape(rows, cols)
+    known = (counts >= 3).reshape(rows, cols).astype(np.float64)
+    if known.sum() == 0:
         return np.ones((rows, cols))
-    fit = np.full(flat.shape, float(np.median(flat[keep])))
-    for _round in range(6):
-        coeffs, *_ = np.linalg.lstsq(basis[keep], flat[keep], rcond=None)
-        fit = basis @ coeffs
-        keep = known.ravel() & (flat > fit * reject)  # shadow blocks drop out of the next fit
-        if keep.sum() < len(terms) * 4:
-            break
-    # the floor's own variation sits about the fit: lift it to the unshadowed blocks' upper side
-    ratio = flat[keep] / np.maximum(fit[keep], 1e-6)
-    fit *= float(np.percentile(ratio, 75)) if len(ratio) else 1.0
-    return np.clip(fit.reshape(rows, cols), 0.02, 2.0)
+    level = np.where(known > 0, level, 0.0)
+    filled = level.copy()
+    for radius in (4.0, 16.0, 64.0):  # holes take their surroundings' level, near ones first
+        weight = _blur(known, radius)
+        guess = _blur(level * known, radius) / np.maximum(weight, 1e-9)
+        filled = np.where((known == 0) & (weight > 1e-3) & (filled == 0), guess, filled)
+    filled = np.where(filled == 0, float(np.median(level[known > 0])), filled)
+    return np.clip(_blur(filled, softness), 0.0, 2.0)
 
 
 # --- Blender: reading the images -------------------------------------------------------------------
@@ -168,6 +220,9 @@ def main() -> None:
     if request.get("mode") == "clean_floor":
         clean_floor_frames(request, start, step)
         return
+    if request.get("mode") == "clean_floor_combine":
+        clean_floor_combine(request)
+        return
     hints: dict[str, np.ndarray] = {}  # one still hint, read once
     try:
         for number, footage, hint in request["frames"][start::step]:
@@ -192,23 +247,47 @@ def main() -> None:
 
 
 def clean_floor_frames(request: dict, start: int, step: int) -> None:
-    """The clean-floor bake: one small grey PNG per plate (value / 2: up to twice the floor colour)."""
-    out_dir, prefix = request["out_dir"], request.get("prefix", "clean_")
+    """The clean-floor bake, sampling: this worker's share of the frames, each looked at from the
+    floor, into one histogram per texel (saved as histogram_<start>.npy; progress_<start>.txt
+    counts the frames done)."""
+    work = request["work"]
+    size = request["size"]
+    grid = floor_grid(*request["grid"], size)
+    histogram = np.zeros((size[0] * size[1], CLEAN_BINS), np.uint16)
+    progress = os.path.join(work, f"progress_{start}.txt")
     try:
-        for number, footage, _hint in request["frames"][start::step]:
-            target = os.path.join(out_dir, f"{prefix}{int(number):06d}.png")
-            if os.path.exists(target):
-                continue
+        done = 0
+        for number, footage, view in request["frames"][start::step]:
             rgba, display = _pixels(footage)
-            rgb = rgba[..., :3]
-            linear = _srgb_to_linear(rgb) if display else np.clip(rgb, 0.0, None)
-            shown = rgb if display else to_display(rgb)
-            level = clean_floor(linear, shown, request["colour"], request["direction"],
-                                int(request.get("degree", 3)), int(request.get("columns", 160)),
-                                float(request.get("reject", 0.93)))
-            write_grey_png(target, level / 2.0)
+            share, valid = floor_samples(rgba, display, grid, view, request["colour"], request["direction"])
+            add_to_histogram(histogram, share, valid)
+            done += 1
+            if done % 5 == 0:
+                with open(progress + ".part", "w") as f:
+                    f.write(str(done))
+                os.replace(progress + ".part", progress)
+        np.save(os.path.join(work, f"histogram_{start}.npy"), histogram)
+        with open(progress + ".part", "w") as f:
+            f.write(str(done))
+        os.replace(progress + ".part", progress)
     except Exception as exc:  # the add-on shows this line
-        with open(os.path.join(out_dir, f"error_{start}.txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(work, f"error_{start}.txt"), "w", encoding="utf-8") as f:
+            f.write(f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def clean_floor_combine(request: dict) -> None:
+    """The clean-floor bake, finishing: the workers' histograms into one 16-bit PNG over the
+    plane's UVs (value / 2: up to twice the floor colour)."""
+    work = request["work"]
+    try:
+        names = [n for n in os.listdir(work) if n.startswith("histogram_") and n.endswith(".npy")]
+        histogram = sum(np.load(os.path.join(work, n)).astype(np.uint32) for n in names)
+        level = clean_floor_level(histogram, request["size"], float(request.get("shadow_time", 0.8)),
+                                  float(request.get("softness", 2.0)))
+        write_grey_png(os.path.join(request["out_dir"], "clean_floor.png"), level / 2.0, depth=16)
+    except Exception as exc:
+        with open(os.path.join(work, "error_combine.txt"), "w", encoding="utf-8") as f:
             f.write(f"{type(exc).__name__}: {exc}")
         raise
 
