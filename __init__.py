@@ -5571,8 +5571,9 @@ class CORRIDORKEY_SHADER_OT_floor_bake(_OnSource, bpy.types.Operator):
     bl_idname = "corridorkey_shader.floor_bake"
     bl_label = "Bake Clean Floor"
     bl_description = (
-        "Measure, frame by frame, how bright the floor is where nothing shades it (a smooth fit "
-        "that ignores shadows), so uneven lighting isn't taken for shadow. Runs in the background"
+        "Measure how bright each spot of the floor is when nothing shades it, from every frame of the "
+        "shot (the Alpha Hint keeps the actor out), so uneven lighting isn't taken for shadow. Runs in "
+        "the background"
     )
 
     def execute(self, context):
