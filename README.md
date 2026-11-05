@@ -70,7 +70,7 @@ A few things to set in Autoshot:
 2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 
-**Updating:** in **Edit > Preferences > Add-ons > CorridorKey 2.0**, the **Updates** box checks this repository for a newer version (also once when Blender starts) and **Update** downloads it and reloads the add-on, with no restart. A newer version also shows an **Update** button at the top of the sidebar. While the repository is private, paste a GitHub token there: a fine-grained token for this repository with **Contents: Read-only**. Blender's **Allow Online Access** (Preferences > System) must be on.
+**Updating:** in **Edit > Preferences > Add-ons > CorridorKey 2.0**, the **Updates** box checks this repository for a newer version (also once when Blender starts) and **Update** downloads it and reloads the add-on, with no restart. A newer version also shows an **Update** button at the top of the sidebar. (The **GitHub Token** field is only needed if the repository is ever made private again: a fine-grained token for it with **Contents: Read-only**.) Blender's **Allow Online Access** (Preferences > System) must be on.
 
 <img src="docs/images/guide.png" alt="The first page of the quick-start guide that the ? button opens" width="520">
 
