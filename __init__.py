@@ -2113,7 +2113,8 @@ def sync(
     if settings.floor_name:
         floor = bpy.data.objects.get(settings.floor_name)
         if floor is not None and floor.get(FLOOR_TAG) == st(src).uid:
-            floor_sync(floor, wired_image_node(src, 0), scene, wired_image_node(src, 1))
+            actors = footage_objects(node)
+            floor_sync(floor, wired_image_node(src, 0), scene, wired_image_node(src, 1), actors[0] if actors else None)
     if preview is not None:  # this frame has been previewed: show the cache, played as a sequence
         image = preview_image(src, *preview)
         plate = wired_image_node(src, 0)
@@ -4468,7 +4469,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 8
+FLOOR_VERSION = 9
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4540,6 +4541,8 @@ def ensure_floor_group():
         "The node's Alpha Hint here and around (Actor Margin): where it's the actor, it isn't floor")
     add("Hint Strength", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "How much the Alpha Hint keeps the actor out of the floor (0: colour alone decides)")
+    add("Actor Near", "NodeSocketFloat", 1.0, 0.0, 1.0,
+        "1 where the floor is about as far from the camera as the actor (their feet), 0 far behind them")
     add("Fill Under Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "Behind the actor the floor can't be seen: carry the shadow next to them in, so it meets their "
         "feet and legs with no light gap where the key is see-through (motion blur, soft edges)")
@@ -4672,8 +4675,10 @@ def ensure_floor_group():
                       math("SUBTRACT", 1.0, math("MULTIPLY", get(f"Fill Hint {index}"), get("Hint Strength"), clamp=True)))
         total_shade = math("ADD", total_shade, math("MULTIPLY", shading(lit), weight))
         total_weight = math("ADD", total_weight, weight)
+    # only on the floor near the actor's own distance (where they stand), not the floor far
+    # behind their body, which their shadow doesn't reach
     under = math("MULTIPLY", math("DIVIDE", total_shade, total_weight),
-                 math("MULTIPLY", actor, get("Fill Under Actor")), clamp=True)
+                 math("MULTIPLY", math("MULTIPLY", actor, get("Fill Under Actor")), get("Actor Near")), clamp=True)
 
     # the area: faded towards the plane's edges, and with distance from the camera
     coords = node("ShaderNodeTexCoord")
@@ -4752,9 +4757,18 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
 FLOOR_HINT, FLOOR_HINT_ON = "CK Floor Hint", "CK Floor Hint On"  # the node's Alpha Hint (the actor)
 FLOOR_FILL = "CK Floor Fill Radius"  # how far around the actor the shadow under them is looked for
+FLOOR_REACH = "CK Floor Fill Reach"  # how far in front of / behind the actor (m) the floor gets that fill
+FLOOR_ACTOR_CENTRE = "CK Floor Actor Centre"  # the footage plane's mesh centre, in its own space
+FLOOR_ACTOR_ON = "CK Floor Actor On"  # 1 when the footage plane is known (the drivers below follow it)
+# driven from the footage plane's and the camera's world matrices (no Python in the drivers)
+# (Autoshot's image plane hangs off the camera: its origin is the camera, its mesh sits out in front,
+# so it's the mesh's centre, through the plane's whole world matrix, that says where the actor is)
+FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{i}][{j}]") for i in range(3) for j in range(4)] + \
+    [(f"CK Floor Camera {a}", "camera", f"matrix_world[{i}][3]") for i, a in enumerate("XYZ")] + \
+    [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[{i}][2]") for i, a in enumerate("XYZ")]
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 7
+FLOOR_MATERIAL_VERSION = 8
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4764,7 +4778,7 @@ def build_floor_material(material) -> None:
     version: the group's settings and the baked clean floor stay."""
     tree = material.node_tree
     nodes, links = tree.nodes, tree.links
-    kept = {name: nodes[name].outputs[0].default_value for name in (FLOOR_BLUR, FLOOR_MARGIN, FLOOR_FILL)
+    kept = {name: nodes[name].outputs[0].default_value for name in (FLOOR_BLUR, FLOOR_MARGIN, FLOOR_FILL, FLOOR_REACH)
             if name in nodes}  # the user's values, put back after the rebuild
     group = nodes.get(FLOOR_NODE)
     clean = nodes.get(FLOOR_CLEAN)
@@ -4996,6 +5010,71 @@ def build_floor_material(material) -> None:
     elif hasattr(material, "blend_method"):
         material.blend_method = "BLEND"
     material.use_backface_culling = False
+    # how near this floor point is to the actor's distance from the camera: the footage plane's
+    # depth (from driven world matrices) against this point's own depth
+    driven = {}
+    for index, (name, _who, _path) in enumerate(FLOOR_ACTOR_AXES):
+        value = nodes.new("ShaderNodeValue")
+        value.name = value.label = name
+        value.location = (-1500, -6400 - 100 * index)
+        driven[name] = value.outputs[0]
+
+    def vector(prefix):
+        combine = nodes.new("ShaderNodeCombineXYZ")
+        for i, a in enumerate("XYZ"):
+            links.new(driven[f"{prefix} {a}"], combine.inputs[i])
+        return combine.outputs[0]
+
+    def vop(op, a, b=None):
+        n = nodes.new("ShaderNodeVectorMath")
+        n.operation = op
+        links.new(a, n.inputs[0])
+        if b is not None:
+            links.new(b, n.inputs[1])
+        return n.outputs["Value" if op in {"DOT_PRODUCT", "LENGTH"} else "Vector"]
+
+    def op(kind, a, b):
+        n = nodes.new("ShaderNodeMath")
+        n.operation = kind
+        for socket, v in zip(n.inputs, (a, b)):
+            if isinstance(v, (int, float)):
+                socket.default_value = v
+            else:
+                links.new(v, socket)
+        return n.outputs[0]
+
+    centre = nodes.new("ShaderNodeCombineXYZ")
+    centre.name = centre.label = FLOOR_ACTOR_CENTRE
+    centre.location = (-1500, -7700)
+    world = nodes.new("ShaderNodeCombineXYZ")
+    for i in range(3):
+        row = nodes.new("ShaderNodeCombineXYZ")
+        for j in range(3):
+            links.new(driven[f"CK Floor Actor M{i}{j}"], row.inputs[j])
+        links.new(op("ADD", vop("DOT_PRODUCT", row.outputs[0], centre.outputs[0]), driven[f"CK Floor Actor M{i}3"]),
+                  world.inputs[i])
+    ahead = vop("NORMALIZE", vector("CK Floor Camera Back"))  # the camera looks down -Z: depth = -dot
+    actor_depth = op("MULTIPLY", vop("DOT_PRODUCT", vop("SUBTRACT", world.outputs[0], vector("CK Floor Camera")),
+                                     ahead), -1.0)
+    view = nodes.new("ShaderNodeCameraData")
+    gap = op("ABSOLUTE", op("SUBTRACT", view.outputs["View Z Depth"], actor_depth), 0.0)
+    reach = nodes.new("ShaderNodeValue")
+    reach.name = reach.label = FLOOR_REACH
+    reach.outputs[0].default_value = 0.75
+    reach.location = (-1500, -7400)
+    near = nodes.new("ShaderNodeMapRange")
+    near.interpolation_type = "SMOOTHSTEP"
+    links.new(gap, near.inputs["Value"])
+    links.new(op("MULTIPLY", reach.outputs[0], 0.5), near.inputs["From Min"])
+    links.new(reach.outputs[0], near.inputs["From Max"])
+    near.inputs["To Min"].default_value, near.inputs["To Max"].default_value = 1.0, 0.0
+    on = nodes.new("ShaderNodeValue")
+    on.name = on.label = FLOOR_ACTOR_ON
+    on.outputs[0].default_value = 0.0
+    on.location = (-1500, -7500)
+    # off (no footage plane known): 1 everywhere, as before
+    links.new(op("ADD", op("MULTIPLY", near.outputs["Result"], on.outputs[0]),
+                 op("SUBTRACT", 1.0, on.outputs[0])), group.inputs["Actor Near"])
     for name, value in kept.items():
         if name in nodes:
             nodes[name].outputs[0].default_value = value
@@ -5063,7 +5142,46 @@ def floor_camera(material, scene) -> bool:
     return changed
 
 
-def floor_sync(obj, plate, scene=None, hint=None) -> bool:
+def floor_actor(material, actor, scene) -> bool:
+    """Drivers from the footage plane's and the camera's world matrices into the material, so the
+    fill under the actor follows where they stand. Off without a footage plane."""
+    nodes = material.node_tree.nodes
+    camera = scene.camera if scene is not None else None
+    on = nodes.get(FLOOR_ACTOR_ON)
+    if on is None:
+        return False
+    usable = actor is not None and camera is not None and actor.type == "MESH" and len(actor.data.vertices)
+    changed = _set(on.outputs[0], "default_value", 1.0 if usable else 0.0)
+    if not usable:
+        return changed
+    centre = nodes.get(FLOOR_ACTOR_CENTRE)
+    if centre is not None:
+        verts = actor.data.vertices  # the mesh as made (not bent by Lay Footage on Floor)
+        middle = [sum(v.co[i] for v in verts) / len(verts) for i in range(3)]
+        for i in range(3):
+            changed |= _set(centre.inputs[i], "default_value", middle[i])
+    animation = material.node_tree.animation_data
+    curves = {c.data_path: c for c in (animation.drivers if animation else ())}
+    for name, who, path in FLOOR_ACTOR_AXES:
+        if nodes.get(name) is None:
+            continue
+        target_id = actor if who == "actor" else camera
+        curve = curves.get(f'nodes["{name}"].outputs[0].default_value')
+        if curve is None:
+            curve = nodes[name].outputs[0].driver_add("default_value")
+            curve.driver.type = "AVERAGE"
+            curve.driver.variables.new().type = "SINGLE_PROP"
+            changed = True
+        target = curve.driver.variables[0].targets[0]
+        if target.id_type != "OBJECT":
+            target.id_type = "OBJECT"
+        if target.id != target_id or target.data_path != path:
+            target.id, target.data_path = target_id, path
+            changed = True
+    return changed
+
+
+def floor_sync(obj, plate, scene=None, hint=None, actor=None) -> bool:
     """The plane's footage: the node's plate, timed as it plays (its clean floor with it), the
     material brought up to date first, the camera's lens and sensor in it."""
     material = obj.active_material
@@ -5076,6 +5194,7 @@ def floor_sync(obj, plate, scene=None, hint=None) -> bool:
         build_floor_material(material)
         changed = True
     changed |= floor_camera(material, scene or bpy.context.scene)
+    changed |= floor_actor(material, actor, scene or bpy.context.scene)
     nodes = material.node_tree.nodes
     image = plate.image
     if image is not None and image.size[0]:
@@ -5393,7 +5512,8 @@ def make_floor_shadows(node, src, scene):
     obj.data.materials.append(material)
     node.corridorkey_shader.floor_name = obj.name
     node.corridorkey_shader.floor_view = "RESULT"
-    floor_sync(obj, plate, None, wired_image_node(src, 1))
+    actors = footage_objects(node)
+    floor_sync(obj, plate, None, wired_image_node(src, 1), actors[0] if actors else None)
     group = floor_group_node(obj)
     colour, why = sample_floor_colour(node, src, scene, obj)
     if colour is None:
@@ -5881,6 +6001,9 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         fill = obj.active_material.node_tree.nodes.get(FLOOR_FILL)
         if fill is not None:
             detect.prop(fill.outputs[0], "default_value", text="Fill Radius (share of height)")
+        reach = obj.active_material.node_tree.nodes.get(FLOOR_REACH)
+        if reach is not None:
+            detect.prop(reach.outputs[0], "default_value", text="Fill Reach (m from the actor)")
         detect.label(text="The Alpha Hint keeps the actor out of the floor and its bake.", icon="CHECKMARK")
     else:
         detect.label(text="No Alpha Hint: the actor is found by colour alone.", icon="INFO")
