@@ -4468,7 +4468,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 7
+FLOOR_VERSION = 8
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4540,6 +4540,13 @@ def ensure_floor_group():
         "The node's Alpha Hint here and around (Actor Margin): where it's the actor, it isn't floor")
     add("Hint Strength", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "How much the Alpha Hint keeps the actor out of the floor (0: colour alone decides)")
+    add("Fill Under Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
+        "Behind the actor the floor can't be seen: carry the shadow next to them in, so it meets their "
+        "feet and legs with no light gap where the key is see-through (motion blur, soft edges)")
+    for index in range(1, len(FLOOR_AROUND) + 1):
+        add(f"Fill {index}", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
+            about="The plate further around (Fill Radius), for the shadow under the actor")
+        add(f"Fill Hint {index}", "NodeSocketFloat", 0.0, 0.0, 1.0, "The Alpha Hint there")
     add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's (cropped) edges (share of its size)")
     for side, about in (("Left", "the camera's left"), ("Right", "the camera's right"),
                         ("Near", "the side nearest the camera"), ("Far", "the far side")):
@@ -4614,13 +4621,16 @@ def ensure_floor_group():
     level = math("MULTIPLY", get("Clean Floor"), 2.0)
     there = math("DIVIDE", vmath("DOT_PRODUCT", plate, clean),
                  math("MAXIMUM", math("MULTIPLY", vmath("DOT_PRODUCT", clean, clean), level), 1e-6), clamp=True)
-    shade = math("SUBTRACT", 1.0, there)
     # levels: black point (Lift), white point, gamma; then density
     lift = get("Lift")
     span = math("MAXIMUM", math("SUBTRACT", get("White Point"), lift), 1e-3)
-    shade = math("DIVIDE", math("SUBTRACT", shade, lift), span, clamp=True)
-    shade = math("POWER", shade, math("DIVIDE", 1.0, math("MAXIMUM", get("Gamma"), 0.01)))
-    shade = math("MULTIPLY", shade, get("Density"), clamp=True)
+    power = math("DIVIDE", 1.0, math("MAXIMUM", get("Gamma"), 0.01))
+
+    def shading(lit):
+        dark = math("DIVIDE", math("SUBTRACT", math("SUBTRACT", 1.0, lit), lift), span, clamp=True)
+        return math("MULTIPLY", math("POWER", dark, power), get("Density"), clamp=True)
+
+    shade = shading(there)
 
     # floor detection (display-like values): the floor's hue, as a share of the floor colour's own
     # (a shadow darkens the floor but keeps its hue: dark shadows stay floor); and not darker than
@@ -4651,6 +4661,19 @@ def ensure_floor_group():
     # the Alpha Hint knows where the actor is: never floor there, however floor-like the colour
     actor = math("MULTIPLY", get("Actor Hint"), get("Hint Strength"), clamp=True)
     floor = math("MULTIPLY", floor, math("SUBTRACT", 1.0, actor))
+    # under the actor: the floor behind them can't be measured, so take the shadow of the floor
+    # around them (the floor points of six taps further out, averaged). Where the key is
+    # see-through, the floor shows shadowed there as it was, not as a light gap.
+    total_shade, total_weight = 0.0, 1e-3
+    for index in range(1, len(FLOOR_AROUND) + 1):
+        colour = get(f"Fill {index}")
+        lit = math("DIVIDE", vmath("DOT_PRODUCT", colour, clean), full, clamp=True)
+        weight = math("MULTIPLY", floorness(colour, lit),
+                      math("SUBTRACT", 1.0, math("MULTIPLY", get(f"Fill Hint {index}"), get("Hint Strength"), clamp=True)))
+        total_shade = math("ADD", total_shade, math("MULTIPLY", shading(lit), weight))
+        total_weight = math("ADD", total_weight, weight)
+    under = math("MULTIPLY", math("DIVIDE", total_shade, total_weight),
+                 math("MULTIPLY", actor, get("Fill Under Actor")), clamp=True)
 
     # the area: faded towards the plane's edges, and with distance from the camera
     coords = node("ShaderNodeTexCoord")
@@ -4682,9 +4705,9 @@ def ensure_floor_group():
                                         math("MAXIMUM", get("Fade End"), math("ADD", start, 1e-3))))
 
     area = math("MULTIPLY", edge, far)  # the plane's edges, the crops, the distance fade
-    amount = math("MULTIPLY", math("MULTIPLY", shade, floor), area, clamp=True)
+    amount = math("MULTIPLY", math("MAXIMUM", math("MULTIPLY", shade, floor), under), area, clamp=True)
     ratio = mix(1.0, (0, 0, 0, 1), vmath("DIVIDE", plate, vmath("MAXIMUM", clean, (1e-4, 1e-4, 1e-4))), clamp=True)
-    core = mix(get("Keep Colour"), get("Shadow Tint"), ratio)
+    core = mix(math("MULTIPLY", get("Keep Colour"), math("SUBTRACT", 1.0, actor)), get("Shadow Tint"), ratio)
     multiply = mix(amount, (1, 1, 1, 1), core, clamp=True)
 
     # what's shown: the result (a see-through multiply), or one of the mattes for tuning
@@ -4728,9 +4751,10 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
 ]
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
 FLOOR_HINT, FLOOR_HINT_ON = "CK Floor Hint", "CK Floor Hint On"  # the node's Alpha Hint (the actor)
+FLOOR_FILL = "CK Floor Fill Radius"  # how far around the actor the shadow under them is looked for
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 6
+FLOOR_MATERIAL_VERSION = 7
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4740,6 +4764,8 @@ def build_floor_material(material) -> None:
     version: the group's settings and the baked clean floor stay."""
     tree = material.node_tree
     nodes, links = tree.nodes, tree.links
+    kept = {name: nodes[name].outputs[0].default_value for name in (FLOOR_BLUR, FLOOR_MARGIN, FLOOR_FILL)
+            if name in nodes}  # the user's values, put back after the rebuild
     group = nodes.get(FLOOR_NODE)
     clean = nodes.get(FLOOR_CLEAN)
     if clean is not None and clean.image is not None and clean.image.source != "FILE":
@@ -4922,6 +4948,43 @@ def build_floor_material(material) -> None:
     links.new(widest, used.inputs[0])
     links.new(hint_on.outputs[0], used.inputs[1])
     links.new(used.outputs[0], group.inputs["Actor Hint"])
+    # the plate and the hint further around (Fill Radius): the shadow under the actor comes from there
+    fill = nodes.new("ShaderNodeValue")
+    fill.name = fill.label = FLOOR_FILL
+    fill.outputs[0].default_value = 0.03
+    fill.location = (-900, -4400)
+    for index, (dx, dy) in enumerate(FLOOR_AROUND, start=1):
+        step = nodes.new("ShaderNodeCombineXYZ")
+        step.inputs[1].default_value = dy
+        across = nodes.new("ShaderNodeMath")
+        across.operation = "MULTIPLY"
+        across.inputs[0].default_value = dx
+        links.new(aspect.outputs[0], across.inputs[1])
+        links.new(across.outputs[0], step.inputs[0])
+        scaled = nodes.new("ShaderNodeVectorMath")
+        scaled.operation = "SCALE"
+        links.new(step.outputs[0], scaled.inputs[0])
+        links.new(fill.outputs[0], scaled.inputs["Scale"])
+        moved = nodes.new("ShaderNodeVectorMath")
+        moved.operation = "ADD"
+        links.new(screen, moved.inputs[0])
+        links.new(scaled.outputs["Vector"], moved.inputs[1])
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.name = texture.label = f"{FLOOR_TEX} Fill {index}"
+        texture.extension = "EXTEND"
+        texture.location = (-300, -4400 - 260 * index)
+        links.new(moved.outputs["Vector"], texture.inputs["Vector"])
+        links.new(texture.outputs["Color"], group.inputs[f"Fill {index}"])
+        hinted = nodes.new("ShaderNodeTexImage")
+        hinted.name = hinted.label = f"{FLOOR_HINT} Fill {index}"
+        hinted.extension = "EXTEND"
+        hinted.location = (-50, -4400 - 260 * index)
+        links.new(moved.outputs["Vector"], hinted.inputs["Vector"])
+        gated = nodes.new("ShaderNodeMath")
+        gated.operation = "MULTIPLY"
+        links.new(hinted.outputs["Color"], gated.inputs[0])
+        links.new(hint_on.outputs[0], gated.inputs[1])
+        links.new(gated.outputs[0], group.inputs[f"Fill Hint {index}"])
     average = nodes.new("ShaderNodeVectorMath")
     average.operation = "SCALE"
     links.new(total, average.inputs[0])
@@ -4933,6 +4996,9 @@ def build_floor_material(material) -> None:
     elif hasattr(material, "blend_method"):
         material.blend_method = "BLEND"
     material.use_backface_culling = False
+    for name, value in kept.items():
+        if name in nodes:
+            nodes[name].outputs[0].default_value = value
     material["ck_floor_version"] = FLOOR_MATERIAL_VERSION
 
 
@@ -5811,7 +5877,10 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     sliders(detect, "Hue Gate", "Hue Softness", "Darkest Shadow")
     hint = wired_image_node(src, 1)
     if hint is not None and hint.image is not None:
-        sliders(detect, "Hint Strength")
+        sliders(detect, "Hint Strength", "Fill Under Actor")
+        fill = obj.active_material.node_tree.nodes.get(FLOOR_FILL)
+        if fill is not None:
+            detect.prop(fill.outputs[0], "default_value", text="Fill Radius (share of height)")
         detect.label(text="The Alpha Hint keeps the actor out of the floor and its bake.", icon="CHECKMARK")
     else:
         detect.label(text="No Alpha Hint: the actor is found by colour alone.", icon="INFO")

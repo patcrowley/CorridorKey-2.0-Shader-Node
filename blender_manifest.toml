@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "corridorkey_shader"
-version = "2.23.1"
+version = "2.24.0"
 name = "CorridorKey 2.0"
 tagline = "CorridorKey shader node: paid or free engine, SAM 3 hints, previews"
 maintainer = "Pat Crowley"
