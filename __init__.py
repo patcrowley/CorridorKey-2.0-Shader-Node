@@ -4769,7 +4769,7 @@ FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{j}][{i}
     [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[2][{i}]") for i, a in enumerate("XYZ")]
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 8
+FLOOR_MATERIAL_VERSION = 9
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -5058,7 +5058,10 @@ def build_floor_material(material) -> None:
     actor_depth = op("MULTIPLY", vop("DOT_PRODUCT", vop("SUBTRACT", world.outputs[0], vector("CK Floor Camera")),
                                      ahead), -1.0)
     view = nodes.new("ShaderNodeCameraData")
-    gap = op("ABSOLUTE", op("SUBTRACT", view.outputs["View Z Depth"], actor_depth), 0.0)
+    # how far behind the actor this floor point is: the fill goes only on floor seen behind them
+    # (through their see-through edges), not where the footage plane itself meets the floor at
+    # their feet, which the see-through shadow plane would otherwise darken
+    gap = op("SUBTRACT", view.outputs["View Z Depth"], actor_depth)
     reach = nodes.new("ShaderNodeValue")
     reach.name = reach.label = FLOOR_REACH
     reach.outputs[0].default_value = 2.5  # the floor seen behind the legs, not behind the body
@@ -5069,12 +5072,17 @@ def build_floor_material(material) -> None:
     links.new(op("MULTIPLY", reach.outputs[0], 0.5), near.inputs["From Min"])
     links.new(reach.outputs[0], near.inputs["From Max"])
     near.inputs["To Min"].default_value, near.inputs["To Max"].default_value = 1.0, 0.0
+    behind = nodes.new("ShaderNodeMapRange")
+    behind.interpolation_type = "SMOOTHSTEP"
+    links.new(gap, behind.inputs["Value"])
+    behind.inputs["From Min"].default_value, behind.inputs["From Max"].default_value = 0.1, 0.3
+    near_behind = op("MULTIPLY", near.outputs["Result"], behind.outputs["Result"])
     on = nodes.new("ShaderNodeValue")
     on.name = on.label = FLOOR_ACTOR_ON
     on.outputs[0].default_value = 0.0
     on.location = (-1500, -7500)
     # off (no footage plane known): 1 everywhere, as before
-    links.new(op("ADD", op("MULTIPLY", near.outputs["Result"], on.outputs[0]),
+    links.new(op("ADD", op("MULTIPLY", near_behind, on.outputs[0]),
                  op("SUBTRACT", 1.0, on.outputs[0])), group.inputs["Actor Near"])
     for name, value in kept.items():
         if name in nodes:
