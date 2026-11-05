@@ -3363,6 +3363,10 @@ class CORRIDORKEY_SHADER_PT_viewport(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        if update_available():
+            row = layout.row(align=True)
+            row.label(text=f"Update {UPDATE_STATE['latest']} available", icon="FILE_REFRESH")
+            row.operator(CORRIDORKEY_SHADER_OT_install_update.bl_idname, text="Update")
         obj = context.active_object
         nodes = object_nodes(obj)
         if not nodes and obj is not None and obj.get(FLOOR_TAG):  # the floor-shadow plane: its node's settings
@@ -6806,6 +6810,241 @@ class CORRIDORKEY_SHADER_OT_open_prefs(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# --- updates from GitHub: check the repository's version, download its add-on files, reload ---------
+
+UPDATE_REPO = "patcrowley/CorridorKey-2.0-Shader-Node"
+UPDATE_BRANCH = "main"
+UPDATE_STATE = {"status": "", "latest": "", "change": "", "busy": False, "error": False}
+_ADDON_FILES = re.compile(r"^(?:[A-Za-z0-9_]+\.py|blender_manifest\.toml|QUICKSTART\.html)$")
+
+
+def installed_version() -> str:
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "blender_manifest.toml"),
+                  encoding="utf-8") as f:
+            found = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+        return found.group(1) if found else "?"
+    except OSError:
+        return "?"
+
+
+def _version_key(text: str) -> tuple:
+    return tuple(int(n) for n in re.findall(r"\d+", text)[:3]) or (0,)
+
+
+def update_available() -> bool:
+    latest = UPDATE_STATE["latest"]
+    return bool(latest) and _version_key(latest) > _version_key(installed_version())
+
+
+def _github(path: str, token: str, raw: bool = False):
+    """One GitHub API request: (bytes) for raw file contents, else the parsed JSON."""
+    import urllib.request
+
+    request = urllib.request.Request(f"https://api.github.com/repos/{UPDATE_REPO}/{path}")
+    request.add_header("Accept", "application/vnd.github.raw" if raw else "application/vnd.github+json")
+    request.add_header("User-Agent", "CorridorKey-2.0-Blender-add-on")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = response.read()
+    return data if raw else json.loads(data)
+
+
+def _github_problem(exc) -> str:
+    code = getattr(exc, "code", None)
+    if code in (401, 403):
+        return "GitHub refused the token (or the rate limit was hit): check the token below."
+    if code == 404:
+        return ("Repository not found: it's private, so add a GitHub token below "
+                "(read access to its contents).")
+    return f"Couldn't reach GitHub: {getattr(exc, 'reason', None) or exc}"
+
+
+def _redraw_preferences() -> None:
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type in {"PREFERENCES", "VIEW_3D"}:
+                area.tag_redraw()
+
+
+def _in_background(work) -> None:
+    """Run `work` (no bpy in it) on a thread; redraw until it's done."""
+    UPDATE_STATE["busy"] = True
+
+    def run():
+        try:
+            work()
+        finally:
+            UPDATE_STATE["busy"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+
+    def watch():
+        _redraw_preferences()
+        return 0.5 if UPDATE_STATE["busy"] else None
+
+    bpy.app.timers.register(watch, first_interval=0.5)
+
+
+def check_for_update(token: str) -> None:
+    """The newest version on GitHub and its last change, into UPDATE_STATE (in the background)."""
+    if UPDATE_STATE["busy"]:
+        return
+    UPDATE_STATE.update(status="Checking GitHub...", error=False)
+
+    def work():
+        try:
+            manifest = _github(f"contents/blender_manifest.toml?ref={UPDATE_BRANCH}", token, raw=True).decode()
+            found = re.search(r'^version\s*=\s*"([^"]+)"', manifest, re.M)
+            latest = found.group(1) if found else ""
+            commit = _github(f"commits/{UPDATE_BRANCH}", token)
+            message = commit.get("commit", {}).get("message", "").splitlines()
+            UPDATE_STATE.update(latest=latest, change=message[0] if message else "")
+            if not latest:
+                UPDATE_STATE.update(status="GitHub's copy has no version.", error=True)
+            elif _version_key(latest) > _version_key(installed_version()):
+                UPDATE_STATE.update(status=f"Version {latest} is available.")
+            else:
+                UPDATE_STATE.update(status=f"Up to date ({installed_version()}).")
+        except Exception as exc:  # network, auth, JSON: shown in the preferences
+            UPDATE_STATE.update(status=_github_problem(exc), error=True)
+
+    _in_background(work)
+
+
+def _reload_addon():
+    """Turn the add-on off and on again, so the new files run (from a timer, after the operator)."""
+    import addon_utils
+
+    addon_utils.disable(ADDON)
+    for name in [n for n in sys.modules if n == ADDON or n.startswith(ADDON + ".")]:
+        del sys.modules[name]
+    addon_utils.enable(ADDON, default_set=True)
+    return None
+
+
+def install_update(token: str) -> None:
+    """Download the add-on's files from GitHub, check them, write them over this add-on and reload."""
+    if UPDATE_STATE["busy"]:
+        return
+    UPDATE_STATE.update(status="Downloading the update...", error=False)
+    folder = os.path.dirname(os.path.abspath(__file__))
+    done = {}
+
+    def work():
+        try:
+            listing = _github(f"contents?ref={UPDATE_BRANCH}", token)
+            names = [e["name"] for e in listing if e.get("type") == "file" and _ADDON_FILES.match(e["name"])]
+            if "__init__.py" not in names or "blender_manifest.toml" not in names:
+                raise RuntimeError("GitHub's copy is missing the add-on's files")
+            files = {name: _github(f"contents/{name}?ref={UPDATE_BRANCH}", token, raw=True) for name in names}
+            for name, data in files.items():  # nothing is written unless every file is whole
+                if not data:
+                    raise RuntimeError(f"{name} came down empty")
+                if name.endswith(".py"):
+                    compile(data.decode("utf-8"), name, "exec")
+            for name, data in files.items():
+                path = os.path.join(folder, name)
+                with open(path + ".part", "wb") as f:
+                    f.write(data)
+            for name in files:
+                path = os.path.join(folder, name)
+                os.replace(path + ".part", path)
+            done["ok"] = True
+        except Exception as exc:
+            for name in os.listdir(folder):
+                if name.endswith(".part"):
+                    try:
+                        os.remove(os.path.join(folder, name))
+                    except OSError:
+                        pass
+            message = _github_problem(exc) if hasattr(exc, "code") or hasattr(exc, "reason") else str(exc)
+            UPDATE_STATE.update(status=f"Update failed, nothing changed: {message}", error=True)
+
+    _in_background(work)
+
+    def finish():
+        if UPDATE_STATE["busy"]:
+            return 0.5
+        if done.get("ok"):
+            UPDATE_STATE.update(status="Updated: reloading the add-on...", latest="")
+            bpy.app.timers.register(_reload_addon, first_interval=0.2)
+        return None
+
+    bpy.app.timers.register(finish, first_interval=0.5)
+
+
+def _jobs_running() -> str:
+    if PREVIEW_JOBS or HINT_JOBS or FLOOR_JOBS or FREE_RENDERS:
+        return "Wait for the previews, hints, bakes and renders that are running to finish."
+    if bpy.app.is_job_running("RENDER"):
+        return "Wait for the render to finish."
+    return ""
+
+
+class CORRIDORKEY_SHADER_OT_check_update(bpy.types.Operator):
+    bl_idname = "corridorkey_shader.check_update"
+    bl_label = "Check for Updates"
+    bl_description = f"See whether GitHub ({UPDATE_REPO}) has a newer version of the add-on"
+
+    def execute(self, context):
+        if not getattr(bpy.app, "online_access", True):
+            UPDATE_STATE.update(status="Online access is off (Preferences > System > Network).", error=True)
+            return {"CANCELLED"}
+        check_for_update(prefs().github_token if prefs() else "")
+        return {"FINISHED"}
+
+
+class CORRIDORKEY_SHADER_OT_install_update(bpy.types.Operator):
+    bl_idname = "corridorkey_shader.install_update"
+    bl_label = "Update"
+    bl_description = (
+        "Download the newest version from GitHub and reload the add-on. The CorridorKey model unloads "
+        "(the next preview takes ~25 s); your scenes and settings stay"
+    )
+
+    def execute(self, context):
+        if not getattr(bpy.app, "online_access", True):
+            UPDATE_STATE.update(status="Online access is off (Preferences > System > Network).", error=True)
+            return {"CANCELLED"}
+        why = _jobs_running()
+        if why:
+            self.report({"WARNING"}, why)
+            return {"CANCELLED"}
+        install_update(prefs().github_token if prefs() else "")
+        return {"FINISHED"}
+
+
+def _check_at_startup():
+    preferences = prefs()
+    if preferences is not None and preferences.check_updates and getattr(bpy.app, "online_access", True):
+        check_for_update(preferences.github_token)
+    return None
+
+
+def draw_updates(layout) -> None:
+    """The Updates box (preferences)."""
+    preferences = prefs()
+    box = layout.box()
+    box.label(text=f"Updates (installed: {installed_version()})", icon="FILE_REFRESH")
+    row = box.row(align=True)
+    row.enabled = not UPDATE_STATE["busy"]
+    row.operator(CORRIDORKEY_SHADER_OT_check_update.bl_idname, icon="VIEWZOOM")
+    if update_available():
+        row.operator(CORRIDORKEY_SHADER_OT_install_update.bl_idname,
+                     text=f"Update to {UPDATE_STATE['latest']}", icon="IMPORT")
+    if UPDATE_STATE["status"]:
+        for part in textwrap.wrap(UPDATE_STATE["status"], 80):
+            box.label(text=part, icon="ERROR" if UPDATE_STATE["error"] else "INFO")
+    if update_available() and UPDATE_STATE["change"]:
+        box.label(text=f"Latest change: {UPDATE_STATE['change']}"[:110])
+    if preferences is not None:
+        box.prop(preferences, "check_updates")
+        box.prop(preferences, "github_token")
+    box.operator("wm.url_open", text="The add-on on GitHub", icon="URL").url = f"https://github.com/{UPDATE_REPO}"
+
+
 class CorridorKey2Preferences(bpy.types.AddonPreferences):
     bl_idname = ADDON
 
@@ -6834,9 +7073,19 @@ class CorridorKey2Preferences(bpy.types.AddonPreferences):
         name="SAM 3 Folder", subtype="DIR_PATH",
         description="Where SAM 3 is installed (its venv and weights). Empty: CorridorKey2.0-SAM3 in your home folder",
     )
+    check_updates: bpy.props.BoolProperty(
+        name="Check for updates when Blender starts", default=True,
+        description="Ask GitHub for a newer version once, a few seconds after Blender starts (needs Online Access)",
+    )
+    github_token: bpy.props.StringProperty(
+        name="GitHub Token", subtype="PASSWORD",
+        description=("Only while the repository is private: a GitHub token with read access to its contents "
+                     "(fine-grained, this repository, Contents: Read-only). Kept in Blender's preferences"),
+    )
 
     def draw(self, context):
         layout = self.layout
+        draw_updates(layout)
         layout.prop(self, "engine")
         layout.label(text=f"In use: {engine_label()}", icon="CHECKMARK" if engine_available() else "ERROR")
         box = layout.box()
@@ -6880,6 +7129,8 @@ _CLASSES = (
     CorridorKeyShaderSettings,
     CorridorKeyFreeSettings,
     CorridorKey2Preferences,
+    CORRIDORKEY_SHADER_OT_check_update,
+    CORRIDORKEY_SHADER_OT_install_update,
     CORRIDORKEY_SHADER_OT_free_render,
     CORRIDORKEY_SHADER_OT_free_cancel,
     CORRIDORKEY_SHADER_OT_free_open_folder,
@@ -6998,6 +7249,8 @@ def register() -> None:
     _DRAW.append(
         bpy.types.SpaceDopeSheetEditor.draw_handler_add(draw_timeline, (), "WINDOW", "POST_PIXEL")
     )
+    if not UPDATE_STATE["latest"] and not UPDATE_STATE["busy"]:
+        bpy.app.timers.register(_check_at_startup, first_interval=5.0)
 
 
 def unregister() -> None:
@@ -7012,6 +7265,8 @@ def unregister() -> None:
     _DRAW.clear()
     if bpy.app.timers.is_registered(tick):
         bpy.app.timers.unregister(tick)
+    if bpy.app.timers.is_registered(_check_at_startup):
+        bpy.app.timers.unregister(_check_at_startup)
     for uid in list(PREVIEW_JOBS):
         cancel_preview(uid)
     for name, fn in _HANDLERS:
