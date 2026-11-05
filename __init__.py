@@ -4763,9 +4763,10 @@ FLOOR_ACTOR_ON = "CK Floor Actor On"  # 1 when the footage plane is known (the d
 # driven from the footage plane's and the camera's world matrices (no Python in the drivers)
 # (Autoshot's image plane hangs off the camera: its origin is the camera, its mesh sits out in front,
 # so it's the mesh's centre, through the plane's whole world matrix, that says where the actor is)
-FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{i}][{j}]") for i in range(3) for j in range(4)] + \
-    [(f"CK Floor Camera {a}", "camera", f"matrix_world[{i}][3]") for i, a in enumerate("XYZ")] + \
-    [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[{i}][2]") for i, a in enumerate("XYZ")]
+# (a driver's path into matrix_world is column first: matrix_world[column][row])
+FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{j}][{i}]") for i in range(3) for j in range(4)] + \
+    [(f"CK Floor Camera {a}", "camera", f"matrix_world[3][{i}]") for i, a in enumerate("XYZ")] + \
+    [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[2][{i}]") for i, a in enumerate("XYZ")]
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
 FLOOR_MATERIAL_VERSION = 8
