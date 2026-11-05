@@ -5061,7 +5061,7 @@ def build_floor_material(material) -> None:
     gap = op("ABSOLUTE", op("SUBTRACT", view.outputs["View Z Depth"], actor_depth), 0.0)
     reach = nodes.new("ShaderNodeValue")
     reach.name = reach.label = FLOOR_REACH
-    reach.outputs[0].default_value = 0.75
+    reach.outputs[0].default_value = 2.5  # the floor seen behind the legs, not behind the body
     reach.location = (-1500, -7400)
     near = nodes.new("ShaderNodeMapRange")
     near.interpolation_type = "SMOOTHSTEP"
