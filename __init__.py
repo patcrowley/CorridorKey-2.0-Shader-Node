@@ -6190,8 +6190,8 @@ def _autoshot_compositor(scene) -> bool:
         return False
     for n in tree.nodes:
         group = getattr(n, "node_tree", None)
-        if n.bl_idname == "CompositorNodeGroup" and group is not None and (
-                group.name.lower().startswith("autoshot") or "key" in n.name.lower()):
+        if n.bl_idname == "CompositorNodeGroup" and group is not None and (  # Autoshot's (once "Zipline")
+                group.name.lower().startswith(("autoshot", "zipline")) or "key" in n.name.lower()):
             return True
         if n.bl_idname == "CompositorNodeKeying":
             return True

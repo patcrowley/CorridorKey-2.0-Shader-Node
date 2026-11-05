@@ -11,7 +11,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 - **Shader node:** add it from **Add > Texture > CorridorKey 2.0**. It has Image and Alpha Hint inputs, and Color and Alpha outputs.
 
   ![The CorridorKey 2.0 node taking the footage and an Alpha Hint, feeding the material's Emission and Mix Shader](docs/images/nodes.png)
-- **One-click Set Up:** right-click a footage plane and choose **Set Up CorridorKey 2.0**. It wires the node between the footage and the shader, and uses the plane's matte as the Alpha Hint. It also turns off a compositor key (Jetset/Autoshot) that would cover CorridorKey's.
+- **One-click Set Up:** right-click a footage plane and choose **Set Up CorridorKey 2.0**. It wires the node between the footage and the shader, and uses the plane's matte as the Alpha Hint. It also turns off a compositor key that would cover CorridorKey's (see [Jetset and Autoshot](#jetset-and-autoshot)).
 - **Controls in the 3D viewport sidebar:** press N and open the **CorridorKey 2.0** tab. A Getting Started checklist covers the engine, footage, saved file and Render Folder, and warnings catch common problems: full paths, missing files, compositing.
 - **Previews:**
   - Preview Frame, plus **Live**, which keys each frame you stop on.
@@ -37,6 +37,27 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
   - **Corridor Add-on (paid):** Corridor Digital's CorridorKey add-on for Blender.
   - **Free (GitHub):** [CorridorKey 2.0](https://github.com/nikopueringer/CorridorKey2.0), with a one-click installer (Windows, NVIDIA GPU).
 
+## Jetset and Autoshot
+
+The add-on is made for the Blender scenes that Autoshot builds from Jetset takes (both by [Lightcraft](https://lightcraft.pro/); see their [Blender round-trip guide](https://docs.lightcraft.pro/tutorials/blender-workflows/autoshot-blender-round-trip)). Open the .blend Autoshot made, select the image plane, right-click it and choose **Set Up CorridorKey 2.0**. That is the whole hookup; the rest of this section is what happens to each part of Autoshot's scene.
+
+| Autoshot's scene | What CorridorKey 2.0 does with it |
+| --- | --- |
+| The image plane (`zl_ip_…`) showing the camera-original plate | **Set Up** puts the CorridorKey 2.0 node between the plate and the plane's shader. The plane then shows CorridorKey's key in the viewport and in renders, on the tracked camera, with no compositing step. |
+| Jetset's AI matte, a greyscale image sequence on the plane | **Set Up** recognises it by name and plugs it into the node's **Alpha Hint**, so CorridorKey knows roughly what to keep. With no matte, it can make one with SAM 3. |
+| Image sequences numbered from 1001 (frame offset 1000) | The node follows the footage's **Start Frame** and **Offset**, so previews, the rendered key and the timeline bars line up with the scene's frames. |
+| Autoshot's compositor (the Autoshot node group, once called Zipline), which keys the plate again and lays it over the render | It would cover CorridorKey's key in renders, so **Set Up** turns compositing off. If compositing is on again, the panel says so and offers **Turn Off Compositing**. |
+| The tracked camera, parented to the shim (`shim_origin_…`) | **Floor Shadows** takes the shim as the floor (the camera's top parent), so the shadow plane sits on Jetset's floor and follows the camera's moves, zooms and lens shift. **Lay Footage on Floor** keeps the image plane from dipping below that floor. |
+| The take's folder, with the .blend in it | Keys and previews are saved in folders next to the .blend, with relative paths, so the take folder can move. **Lock for Render Farm** freezes the finished key into plain nodes for render farms such as SheepIt. |
+
+A few things to set in Autoshot:
+
+- **Export the plate as an image sequence (EXR or PNG), not a movie.** CorridorKey keys frames from a sequence, and Jetset's AI roto needs EXR or PNG media too.
+- **Turn on the AI matte** if you want it as the Alpha Hint. It's optional: CorridorKey keys without one, and **Set Up** can make one with SAM 3.
+- **Key in the .blend Autoshot saved in the take folder** (or save yours before keying), so keys land next to it with relative paths.
+
+> Jetset and Autoshot are Lightcraft Technology's. This add-on is not made by or affiliated with Lightcraft.
+
 ## Requirements
 
 - Blender 5.0 or later
@@ -45,7 +66,7 @@ A Blender add-on that makes Corridor Digital's CorridorKey AI keyer work as a **
 
 ## Install
 
-1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.21.1.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
+1. Download the add-on zip from [`dist/`](dist), for example `CorridorKey_2.0-v2.21.2.zip`. Use that file rather than GitHub's **Code > Download ZIP**, which also packs the README and license. Or zip the add-on files yourself: `__init__.py`, `free_server.py`, `sam3_worker.py`, `screen_key_worker.py`, `blender_manifest.toml`, `QUICKSTART.html`.
 2. In Blender, go to **Edit > Preferences > Get Extensions**, open the menu at the top right, and choose **Install from Disk...** with that zip.
 3. Open the 3D viewport sidebar (N), then the **CorridorKey 2.0** tab, and click **?** for the quick-start guide.
 
