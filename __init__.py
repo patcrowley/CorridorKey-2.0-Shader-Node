@@ -2113,7 +2113,7 @@ def sync(
     if settings.floor_name:
         floor = bpy.data.objects.get(settings.floor_name)
         if floor is not None and floor.get(FLOOR_TAG) == st(src).uid:
-            floor_sync(floor, wired_image_node(src, 0), scene)
+            floor_sync(floor, wired_image_node(src, 0), scene, wired_image_node(src, 1))
     if preview is not None:  # this frame has been previewed: show the cache, played as a sequence
         image = preview_image(src, *preview)
         plate = wired_image_node(src, 0)
@@ -4468,7 +4468,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 6
+FLOOR_VERSION = 7
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4536,6 +4536,10 @@ def ensure_floor_group():
     for index in range(1, len(FLOOR_AROUND) + 1):
         add(f"Around {index}", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
             about="The plate a little way off (Actor Margin): a point counts as floor only if these do too")
+    add("Actor Hint", "NodeSocketFloat", 0.0, 0.0, 1.0,
+        "The node's Alpha Hint here and around (Actor Margin): where it's the actor, it isn't floor")
+    add("Hint Strength", "NodeSocketFloat", 1.0, 0.0, 1.0,
+        "How much the Alpha Hint keeps the actor out of the floor (0: colour alone decides)")
     add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's (cropped) edges (share of its size)")
     for side, about in (("Left", "the camera's left"), ("Right", "the camera's right"),
                         ("Near", "the side nearest the camera"), ("Far", "the far side")):
@@ -4644,6 +4648,9 @@ def ensure_floor_group():
         colour = get(f"Around {index}")
         lit = math("DIVIDE", vmath("DOT_PRODUCT", colour, clean), full, clamp=True)
         floor = math("MINIMUM", floor, floorness(colour, lit))
+    # the Alpha Hint knows where the actor is: never floor there, however floor-like the colour
+    actor = math("MULTIPLY", get("Actor Hint"), get("Hint Strength"), clamp=True)
+    floor = math("MULTIPLY", floor, math("SUBTRACT", 1.0, actor))
 
     # the area: faded towards the plane's edges, and with distance from the camera
     coords = node("ShaderNodeTexCoord")
@@ -4720,9 +4727,10 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
               (0.866, -0.5),
 ]
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
+FLOOR_HINT, FLOOR_HINT_ON = "CK Floor Hint", "CK Floor Hint On"  # the node's Alpha Hint (the actor)
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 5
+FLOOR_MATERIAL_VERSION = 6
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4864,6 +4872,7 @@ def build_floor_material(material) -> None:
     margin.name = margin.label = FLOOR_MARGIN
     margin.outputs[0].default_value = 0.004
     margin.location = (-900, 300)
+    offsets = [screen]
     for index, (dx, dy) in enumerate(FLOOR_AROUND, start=1):
         texture = nodes.new("ShaderNodeTexImage")
         texture.name = texture.label = f"{FLOOR_TEX} Around {index}"
@@ -4886,6 +4895,33 @@ def build_floor_material(material) -> None:
         links.new(scaled.outputs["Vector"], moved.inputs[1])
         links.new(moved.outputs["Vector"], texture.inputs["Vector"])
         links.new(texture.outputs["Color"], group.inputs[f"Around {index}"])
+        offsets.append(moved.outputs["Vector"])
+    # the Alpha Hint (the actor), here and at the same points around: the most of them, so the
+    # actor's soft edge is kept out too. Off (0) when the node has no hint.
+    widest = None
+    for index, vector in enumerate(offsets):
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.name = texture.label = FLOOR_HINT if index == 0 else f"{FLOOR_HINT} {index}"
+        texture.extension = "EXTEND"
+        texture.location = (-300, -2400 - 260 * index)
+        links.new(vector, texture.inputs["Vector"])
+        if widest is None:
+            widest = texture.outputs["Color"]
+        else:
+            most = nodes.new("ShaderNodeMath")
+            most.operation = "MAXIMUM"
+            links.new(widest, most.inputs[0])
+            links.new(texture.outputs["Color"], most.inputs[1])
+            widest = most.outputs[0]
+    hint_on = nodes.new("ShaderNodeValue")
+    hint_on.name = hint_on.label = FLOOR_HINT_ON
+    hint_on.outputs[0].default_value = 0.0
+    hint_on.location = (-900, -2400)
+    used = nodes.new("ShaderNodeMath")
+    used.operation = "MULTIPLY"
+    links.new(widest, used.inputs[0])
+    links.new(hint_on.outputs[0], used.inputs[1])
+    links.new(used.outputs[0], group.inputs["Actor Hint"])
     average = nodes.new("ShaderNodeVectorMath")
     average.operation = "SCALE"
     links.new(total, average.inputs[0])
@@ -4961,7 +4997,7 @@ def floor_camera(material, scene) -> bool:
     return changed
 
 
-def floor_sync(obj, plate, scene=None) -> bool:
+def floor_sync(obj, plate, scene=None, hint=None) -> bool:
     """The plane's footage: the node's plate, timed as it plays (its clean floor with it), the
     material brought up to date first, the camera's lens and sensor in it."""
     material = obj.active_material
@@ -4988,6 +5024,21 @@ def floor_sync(obj, plate, scene=None) -> bool:
             user = node.image_user
             for attr in ("frame_start", "frame_offset", "frame_duration"):
                 changed |= _set(user, attr, getattr(plate, attr))
+            changed |= _set(user, "use_auto_refresh", True)
+            changed |= _set(user, "use_cyclic", False)
+    # the node's Alpha Hint (the actor), timed as its own node plays it
+    hint_image = hint.image if hint is not None else None
+    on = nodes.get(FLOOR_HINT_ON)
+    if on is not None:
+        changed |= _set(on.outputs[0], "default_value", 1.0 if hint_image is not None else 0.0)
+    for node in nodes:
+        if node.bl_idname != "ShaderNodeTexImage" or not node.name.startswith(FLOOR_HINT):
+            continue
+        changed |= _set(node, "image", hint_image)
+        if hint_image is not None:
+            user = node.image_user
+            for attr in ("frame_start", "frame_offset", "frame_duration"):
+                changed |= _set(user, attr, getattr(hint, attr))
             changed |= _set(user, "use_auto_refresh", True)
             changed |= _set(user, "use_cyclic", False)
     return changed
@@ -5276,7 +5327,7 @@ def make_floor_shadows(node, src, scene):
     obj.data.materials.append(material)
     node.corridorkey_shader.floor_name = obj.name
     node.corridorkey_shader.floor_view = "RESULT"
-    floor_sync(obj, plate)
+    floor_sync(obj, plate, None, wired_image_node(src, 1))
     group = floor_group_node(obj)
     colour, why = sample_floor_colour(node, src, scene, obj)
     if colour is None:
@@ -5356,6 +5407,19 @@ def start_floor_bake(node, src, scene) -> str | None:
             frames.append((frame, number))
     if not frames:
         return "No footage frames found for the scene's frame range."
+    hint = wired_image_node(src, 1)  # the Alpha Hint keeps the actor out of the clean floor
+    hint_image = hint.image if hint is not None else None
+    hint_of = lambda frame: ""
+    if hint_image is not None and hint_image.source == "SEQUENCE":
+        hint_folder = os.path.dirname(bpy.path.abspath(hint_image.filepath, library=hint_image.library))
+        hints = numbered(hint_folder)
+
+        def hint_of(frame):
+            number = frame - hint.frame_start + 1 + hint.frame_offset
+            return os.path.join(hint_folder, hints[number]) if number in hints else ""
+    elif hint_image is not None and hint_image.source == "FILE":
+        still = bpy.path.abspath(hint_image.filepath, library=hint_image.library)
+        hint_of = lambda frame: still
     origin, across, along = square
     texel = max(across.length, along.length) / FLOOR_TEXELS
     size = [max(8, round(across.length / texel)), max(8, round(along.length / texel))]
@@ -5366,7 +5430,7 @@ def start_floor_bake(node, src, scene) -> str | None:
             scene.frame_set(frame)
             matrix = scene.camera.matrix_world.inverted() @ obj.matrix_world
             view = [v for row in matrix for v in row] + [scene.camera.data.lens, *camera_factors(scene)]
-            jobs.append([number, os.path.join(folder, plates[number]), view])
+            jobs.append([number, os.path.join(folder, plates[number]), view, hint_of(frame)])
     finally:
         scene.frame_set(current, subframe=sub)
     root = bpy.path.abspath("//CorridorKey/Floor") if bpy.data.filepath else os.path.join(
@@ -5744,6 +5808,12 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
 
     detect = _fold(box, settings, "ui_floor_detect", "Floor Detection", "RESTRICT_SELECT_OFF")
     sliders(detect, "Hue Gate", "Hue Softness", "Darkest Shadow")
+    hint = wired_image_node(src, 1)
+    if hint is not None and hint.image is not None:
+        sliders(detect, "Hint Strength")
+        detect.label(text="The Alpha Hint keeps the actor out of the floor and its bake.", icon="CHECKMARK")
+    else:
+        detect.label(text="No Alpha Hint: the actor is found by colour alone.", icon="INFO")
     margin = obj.active_material.node_tree.nodes.get(FLOOR_MARGIN)
     if margin is not None:
         detect.prop(margin.outputs[0], "default_value", text="Actor Margin (share of height)")

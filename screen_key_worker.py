@@ -110,7 +110,24 @@ def floor_grid(origin, across, along, size):
     return np.concatenate([points, np.ones((rows, cols, 1))], axis=2)
 
 
-def floor_samples(rgb: np.ndarray, display: bool, grid: np.ndarray, view, colour, direction):
+def actor_blocks(hint: np.ndarray, block: int = 8) -> np.ndarray:
+    """The Alpha Hint, widened: each block of pixels is the actor if any of it is (bottom row
+    first, as Blender reads it). Keeps the actor's soft edges out of the floor."""
+    height, width = hint.shape[:2]
+    rows, cols = -(-height // block), -(-width // block)
+    padded = np.zeros((rows * block, cols * block), np.float32)
+    padded[:height, :width] = hint
+    blocks = padded.reshape(rows, block, cols, block).max(axis=(1, 3))
+    widened = blocks.copy()  # and the blocks next to them
+    widened[1:] = np.maximum(widened[1:], blocks[:-1])
+    widened[:-1] = np.maximum(widened[:-1], blocks[1:])
+    blocks = widened.copy()
+    widened[:, 1:] = np.maximum(widened[:, 1:], blocks[:, :-1])
+    widened[:, :-1] = np.maximum(widened[:, :-1], blocks[:, 1:])
+    return widened
+
+
+def floor_samples(rgb: np.ndarray, display: bool, grid: np.ndarray, view, colour, direction, actor=None):
     """One frame seen from the floor: for each texel, the floor's brightness there as a share of
     the floor colour, and whether it's measurable (in frame, in front, the screen's hue: not the
     actor or the set). `view`: plane-to-camera matrix (16, row-major), lens, kx, ky, sx, sy."""
@@ -140,6 +157,11 @@ def floor_samples(rgb: np.ndarray, display: bool, grid: np.ndarray, view, colour
     own = max(float(own @ direction) / (float(np.linalg.norm(own)) + 0.03), 1e-3)
     hueness = (shown @ direction) / (np.linalg.norm(shown, axis=-1) + 0.03) / own
     floor = (hueness > 0.45) & (share > 0.15)
+    if actor is not None:  # the Alpha Hint's actor (widened by actor_blocks) is never floor
+        rows, cols = actor.shape
+        ay = np.clip((v * rows).astype(np.int64), 0, rows - 1)
+        ax = np.clip((u * cols).astype(np.int64), 0, cols - 1)
+        floor &= actor[ay, ax] < 0.25
     return share, inside & floor
 
 
@@ -262,9 +284,11 @@ def clean_floor_frames(request: dict, start: int, step: int) -> None:
     progress = os.path.join(work, f"progress_{start}.txt")
     try:
         done = 0
-        for number, footage, view in request["frames"][start::step]:
+        for number, footage, view, *rest in request["frames"][start::step]:
             rgba, display = _pixels(footage)
-            share, valid = floor_samples(rgba, display, grid, view, request["colour"], request["direction"])
+            hint = rest[0] if rest else ""
+            actor = actor_blocks(_pixels(hint)[0][..., 0]) if hint and os.path.isfile(hint) else None
+            share, valid = floor_samples(rgba, display, grid, view, request["colour"], request["direction"], actor)
             add_to_histogram(histogram, share, valid)
             done += 1
             if done % 5 == 0:
