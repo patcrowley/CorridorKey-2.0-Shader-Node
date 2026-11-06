@@ -6132,9 +6132,9 @@ FLOOR_PRESETS = {  # Lift, White Point, Gamma, Density
 }
 FLOOR_VIEW_NOTES = {
     "RESULT": "The shadows as they'll render.",
-    "MATTE": "White is shadow that's kept: shape it with the Shadow sliders.",
-    "FLOOR": "White counts as floor: the actor and set pieces should be black.",
-    "CLEAN": "The floor's lighting with no shadows on it (from the bake).",
+    "MATTE": "White = shadow kept. Shape it below.",
+    "FLOOR": "White = floor. The actor must be black.",
+    "CLEAN": "The floor's lighting, from the bake.",
 }
 
 
@@ -6172,11 +6172,12 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     baked = bool(inputs["Clean Floor"].links)
     if not baked and uid not in FLOOR_JOBS:
         steps = box.column(align=True)
-        steps.label(text="1  Pick the floor colour (eyedropper on bare floor)", icon="BLANK1")
+        steps.label(text="1  Pick the floor colour", icon="BLANK1")
         steps.label(text="2  Bake the clean floor", icon="BLANK1")
-        steps.label(text="3  Shape the shadow in the Matte view", icon="BLANK1")
+        steps.label(text="3  Shape it in the Matte view", icon="BLANK1")
     row = box.row(align=True)
     row.prop(inputs["Floor Colour"], "default_value", text="Floor Colour")
+    row.separator()
     row.operator(CORRIDORKEY_SHADER_OT_floor_sample.bl_idname, text="", icon="EYEDROPPER").uid = uid
 
     clean = _fold(box, settings, "ui_floor_clean", "Clean Floor", "LIGHT_AREA",
@@ -6225,13 +6226,13 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     hint = wired_image_node(src, 1)
     hinted = hint is not None and hint.image is not None
     if keyed:
-        detect.label(text="This frame is keyed: CorridorKey's alpha finds the actor.", icon="CHECKMARK")
+        detect.label(text="Keyed frame: the key finds the actor", icon="CHECKMARK")
     elif hinted:
-        detect.label(text="Not keyed here: the Alpha Hint finds the actor.", icon="MOD_MASK")
+        detect.label(text="No key: the Alpha Hint finds the actor", icon="MOD_MASK")
     else:
-        detect.label(text="Not keyed, no Alpha Hint: colour alone finds the actor.", icon="INFO")
+        detect.label(text="No key or hint: found by colour", icon="INFO")
     around = detect.box().column(align=True)
-    around.label(text="Around the actor (frames with no key)")
+    around.label(text="Frames with no key")
     around.active = not keyed
     if hinted:
         around.prop(inputs["Hint Strength"], "default_value", text=FLOOR_LABELS["Hint Strength"], slider=True)
