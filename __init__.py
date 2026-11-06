@@ -3263,19 +3263,21 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
 
     # The engine's own settings sections, drawn for the hidden compositor node (their Render
     # section is in the Render box above). Ours slot in between theirs: the Alpha Hint above
-    # Despill, the Tips above Help. All of CorridorKey together, then the set.
+    # Despill; then the set (the footage laid on the floor, the real shadows kept on it); and
+    # the Tips and Help always last.
+    def before_help(where):
+        where.separator()
+        draw_lay_on_floor(where, node, src, scene)
+        draw_floor_shadows(where, node, src, scene)
+        where.separator()
+        draw_tips(where, node, src, scene)
+
     hooks = {"before_despill": lambda where: draw_alpha_hint(where, node, src, scene, hint),
-             "before_help": lambda where: draw_tips(where, node, src, scene)}
+             "before_help": before_help}
     if is_free_source(src):
         draw_free_controls(layout, src, **hooks)
     else:
         draw_paid_controls(layout, src, scene, **hooks)
-
-    # on the virtual set: the floor, the footage laid on it, the real shadows kept on it
-    layout.separator()
-    draw_set_floor(layout, node, src, scene)
-    draw_lay_on_floor(layout, node, src, scene)
-    draw_floor_shadows(layout, node, src, scene)
 
 
 def engine_column(layout, src):
@@ -6307,7 +6309,8 @@ def draw_set_floor(layout, node, src, scene) -> None:
     row.prop_search(settings, "floor_ref", bpy.data, "objects", text="Floor", icon="EMPTY_AXIS")
     if not settings.floor_ref:
         found = floor_reference(scene)
-        layout.label(text=f"Using {found.name}" if found else "Using the world's Z = 0", icon="BLANK1")
+        layout.label(text=f"Using {found.name} (Floor Shadows too)" if found else "Using the world's Z = 0",
+                     icon="BLANK1")
 
 
 def draw_lay_on_floor(layout, node, src, scene) -> None:
@@ -6315,6 +6318,7 @@ def draw_lay_on_floor(layout, node, src, scene) -> None:
     uid, settings = st(src).uid, node.corridorkey_shader
     laid = any(bend_modifier(o) is not None for o in footage_objects(node))
     box = _fold(layout, settings, "ui_bend", "Lay Footage on Floor", "MOD_SIMPLEDEFORM", "on" if laid else "")
+    draw_set_floor(box, node, src, scene)  # the floor (Floor Shadows sits on it too)
     if not laid:
         _lines(box, "Where the footage plane would go through the floor, fold it onto the floor along "
                     "the camera's view: the actor stands on the set, and the camera sees the same.",
