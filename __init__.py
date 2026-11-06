@@ -4559,7 +4559,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 11
+FLOOR_VERSION = 12
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4645,9 +4645,15 @@ def ensure_floor_group():
     add("Fill Under Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "Behind the actor the floor can't be seen: carry the shadow next to them in, so it meets their "
         "feet and legs with no light gap where the key is see-through (motion blur, soft edges)")
+    add("Fill Toward Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
+        "On keyed frames: carry the strongest shadow within Fill Radius in toward the actor, so it "
+        "reaches their feet and legs instead of stopping short (0: only the shadow as shot)")
+    add("Actor Close", "NodeSocketFloat", 1.0, 0.0, 1.0,
+        "1 where the floor is about as far from the camera as the actor, in front or behind")
     for index in range(1, len(FLOOR_AROUND) + 1):
         add(f"Fill {index}", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
             about="The plate further around (Fill Radius), for the shadow under the actor")
+        add(f"Fill Key {index}", "NodeSocketFloat", 0.0, 0.0, 1.0, "The key's alpha there")
         add(f"Fill Hint {index}", "NodeSocketFloat", 0.0, 0.0, 1.0, "The Alpha Hint there")
     add("Edge Feather", "NodeSocketFloat", 0.05, 0.0, 0.5, "Fade at the plane's (cropped) edges (share of its size)")
     for side, about in (("Left", "the camera's left"), ("Right", "the camera's right"),
@@ -4782,6 +4788,7 @@ def ensure_floor_group():
     # around them (the floor points of six taps further out, averaged). Where the key is
     # see-through, the floor shows shadowed there as it was, not as a light gap.
     total_shade, total_weight = 0.0, 1e-3
+    strongest, actor_by = 0.0, 0.0
     for index in range(1, len(FLOOR_AROUND) + 1):
         colour = get(f"Fill {index}")
         lit = math("DIVIDE", vmath("DOT_PRODUCT", colour, clean), full, clamp=True)
@@ -4789,6 +4796,16 @@ def ensure_floor_group():
                       math("SUBTRACT", 1.0, math("MULTIPLY", get(f"Fill Hint {index}"), get("Hint Strength"), clamp=True)))
         total_shade = math("ADD", total_shade, math("MULTIPLY", shading(lit), weight))
         total_weight = math("ADD", total_weight, weight)
+        # keyed frames: the strongest floor shadow around (not on the actor), and whether the actor is near
+        tap_key = math("MULTIPLY", get(f"Fill Key {index}"), key_on, clamp=True)
+        strongest = math("MAXIMUM", strongest, math("MULTIPLY", math("MULTIPLY", shading(lit), floorness(colour, lit)),
+                                                    math("SUBTRACT", 1.0, tap_key)))
+        actor_by = math("MAXIMUM", actor_by, tap_key)
+    # keyed frames: near the actor (within Fill Radius on screen, about their distance from the
+    # camera), the shadow around reaches in to meet them: the floor between their feet and their
+    # shadow isn't left lit
+    toward = math("MULTIPLY", math("MULTIPLY", strongest, actor_by),
+                  math("MULTIPLY", get("Actor Close"), get("Fill Toward Actor")), clamp=True)
     # only on the floor near the actor's own distance (where they stand), not the floor far
     # behind their body, which their shadow doesn't reach
     under = math("MULTIPLY", math("DIVIDE", total_shade, total_weight),
@@ -4824,7 +4841,8 @@ def ensure_floor_group():
                                         math("MAXIMUM", get("Fade End"), math("ADD", start, 1e-3))))
 
     area = math("MULTIPLY", edge, far)  # the plane's edges, the crops, the distance fade
-    amount = math("MULTIPLY", math("MAXIMUM", math("MULTIPLY", shade, floor), under), area, clamp=True)
+    amount = math("MULTIPLY", math("MAXIMUM", math("MAXIMUM", math("MULTIPLY", shade, floor), under), toward), area,
+                  clamp=True)
     amount = math("MULTIPLY", amount, math("SUBTRACT", 1.0, math("MULTIPLY", solid, key_on)))
     ratio = mix(1.0, (0, 0, 0, 1), vmath("DIVIDE", plate, vmath("MAXIMUM", clean, (1e-4, 1e-4, 1e-4))), clamp=True)
     core = mix(math("MULTIPLY", get("Keep Colour"), math("SUBTRACT", 1.0, actor)), get("Shadow Tint"), ratio)
@@ -4885,7 +4903,7 @@ FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{j}][{i}
     [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[2][{i}]") for i, a in enumerate("XYZ")]
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 10
+FLOOR_MATERIAL_VERSION = 11
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4895,8 +4913,16 @@ def build_floor_material(material) -> None:
     version: the group's settings and the baked clean floor stay."""
     tree = material.node_tree
     nodes, links = tree.nodes, tree.links
-    kept = {name: nodes[name].outputs[0].default_value for name in (FLOOR_BLUR, FLOOR_MARGIN, FLOOR_FILL, FLOOR_REACH)
-            if name in nodes}  # the user's values, put back after the rebuild
+    kept = {name: nodes[name].outputs[0].default_value
+            for name in (FLOOR_BLUR, FLOOR_MARGIN, FLOOR_FILL, FLOOR_REACH, FLOOR_KEY_ON, FLOOR_HINT_ON)
+            if name in nodes}  # the user's values (and what was synced), put back after the rebuild
+    # the key's and the hint's images, as synced (a locked node isn't synced again)
+    kept_images = {}
+    for prefix in (FLOOR_KEY, FLOOR_HINT):
+        first = nodes.get(prefix)
+        if first is not None and first.bl_idname == "ShaderNodeTexImage" and first.image is not None:
+            user = first.image_user
+            kept_images[prefix] = (first.image, user.frame_start, user.frame_offset, user.frame_duration)
     group = nodes.get(FLOOR_NODE)
     clean = nodes.get(FLOOR_CLEAN)
     if clean is not None and clean.image is not None and clean.image.source != "FILE":
@@ -5129,6 +5155,12 @@ def build_floor_material(material) -> None:
         links.new(hinted.outputs["Color"], gated.inputs[0])
         links.new(hint_on.outputs[0], gated.inputs[1])
         links.new(gated.outputs[0], group.inputs[f"Fill Hint {index}"])
+        keyed = nodes.new("ShaderNodeTexImage")
+        keyed.name = keyed.label = f"{FLOOR_KEY} Fill {index}"
+        keyed.extension = "EXTEND"
+        keyed.location = (200, -4400 - 260 * index)
+        links.new(moved.outputs["Vector"], keyed.inputs["Vector"])
+        links.new(keyed.outputs["Alpha"], group.inputs[f"Fill Key {index}"])
     average = nodes.new("ShaderNodeVectorMath")
     average.operation = "SCALE"
     links.new(total, average.inputs[0])
@@ -5206,6 +5238,11 @@ def build_floor_material(material) -> None:
     links.new(gap, behind.inputs["Value"])
     behind.inputs["From Min"].default_value, behind.inputs["From Max"].default_value = 0.1, 0.3
     near_behind = op("MULTIPLY", near.outputs["Result"], behind.outputs["Result"])
+    front = nodes.new("ShaderNodeMapRange")  # in front of the actor: up to about half a metre
+    front.interpolation_type = "SMOOTHSTEP"
+    links.new(gap, front.inputs["Value"])
+    front.inputs["From Min"].default_value, front.inputs["From Max"].default_value = -0.6, -0.3
+    close = op("MULTIPLY", near.outputs["Result"], front.outputs["Result"])
     on = nodes.new("ShaderNodeValue")
     on.name = on.label = FLOOR_ACTOR_ON
     on.outputs[0].default_value = 0.0
@@ -5213,9 +5250,19 @@ def build_floor_material(material) -> None:
     # off (no footage plane known): 1 everywhere, as before
     links.new(op("ADD", op("MULTIPLY", near_behind, on.outputs[0]),
                  op("SUBTRACT", 1.0, on.outputs[0])), group.inputs["Actor Near"])
+    links.new(op("ADD", op("MULTIPLY", close, on.outputs[0]),
+                 op("SUBTRACT", 1.0, on.outputs[0])), group.inputs["Actor Close"])
     for name, value in kept.items():
         if name in nodes:
             nodes[name].outputs[0].default_value = value
+    for prefix, (image, start, offset, duration) in kept_images.items():
+        for texture in nodes:
+            if texture.bl_idname == "ShaderNodeTexImage" and texture.name.startswith(prefix) and \
+                    not (prefix == FLOOR_KEY and texture.name.startswith(FLOOR_HINT)):
+                texture.image = image
+                user = texture.image_user
+                user.frame_start, user.frame_offset, user.frame_duration = start, offset, duration
+                user.use_auto_refresh, user.use_cyclic = True, False
     material["ck_floor_version"] = FLOOR_MATERIAL_VERSION
 
 
@@ -5351,10 +5398,10 @@ def floor_sync(obj, plate, scene=None, hint=None, actor=None, key=None) -> bool:
             changed |= _set(user, "use_cyclic", False)
     # the key now shown (previewed or rendered), timed as the node plays it
     key_image = key.image if key is not None else None
-    key_node, key_on = nodes.get(FLOOR_KEY), nodes.get(FLOOR_KEY_ON)
+    key_on = nodes.get(FLOOR_KEY_ON)
     if key_on is not None:
         changed |= _set(key_on.outputs[0], "default_value", 1.0 if key_image is not None else 0.0)
-    if key_node is not None:
+    for key_node in [n for n in nodes if n.bl_idname == "ShaderNodeTexImage" and n.name.startswith(FLOOR_KEY)]:
         changed |= _set(key_node, "image", key_image)
         if key_image is not None:
             user, source = key_node.image_user, key.image_user
@@ -6122,7 +6169,7 @@ FLOOR_LABELS = {
     "Lift": "Ignore Faint", "White Point": "Full Shadow At", "Gamma": "Soft Edges", "Density": "Darkness",
     "Shadow Tint": "Colour", "Keep Colour": "Footage Colour", "Hue Gate": "Colour Match",
     "Hue Softness": "Match Softness", "Darkest Shadow": "Ignore Very Dark", "Hint Strength": "Use Alpha Hint",
-    "Fill Under Actor": "Fill Under Actor", "Edge Feather": "Edge Feather",
+    "Fill Under Actor": "Fill Under Actor", "Edge Feather": "Edge Feather", "Fill Toward Actor": "Reach the Actor",
 }
 FLOOR_PRESETS = {  # Lift, White Point, Gamma, Density
     "SUBTLE": (0.35, 0.9, 0.8, 0.7),
@@ -6231,6 +6278,13 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         detect.label(text="No key: the Alpha Hint finds the actor", icon="MOD_MASK")
     else:
         detect.label(text="No key or hint: found by colour", icon="INFO")
+    toward = detect.column(align=True)
+    if "Fill Toward Actor" in inputs:
+        row = toward.row(align=True)
+        row.active = keyed
+        row.prop(inputs["Fill Toward Actor"], "default_value", text=FLOOR_LABELS["Fill Toward Actor"], slider=True)
+    if FLOOR_FILL in nodes:
+        toward.prop(settings, "floor_fill_radius", slider=True)
     around = detect.box().column(align=True)
     around.label(text="Frames with no key")
     around.active = not keyed
@@ -6240,8 +6294,6 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         around.prop(settings, "floor_margin", slider=True)
     if hinted:
         around.prop(inputs["Fill Under Actor"], "default_value", text="Fill Under Actor", slider=True)
-        if FLOOR_FILL in nodes:
-            around.prop(settings, "floor_fill_radius", slider=True)
         if FLOOR_REACH in nodes:
             around.prop(settings, "floor_fill_reach", slider=True)
 
