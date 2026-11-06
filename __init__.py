@@ -2110,11 +2110,18 @@ def sync(
     screen_changed = False
     if settings.screen_clean or settings.screen_show:
         screen_changed = screen_update(node.node_tree, settings, wired_image_node(src, 0))
-    if settings.floor_name:
+
+    def floor_update(key) -> bool:
+        """The floor-shadow plane, given the key now shown (an image node, or None)."""
+        if not settings.floor_name:
+            return False
         floor = bpy.data.objects.get(settings.floor_name)
-        if floor is not None and floor.get(FLOOR_TAG) == st(src).uid:
-            actors = footage_objects(node)
-            floor_sync(floor, wired_image_node(src, 0), scene, wired_image_node(src, 1), actors[0] if actors else None)
+        if floor is None or floor.get(FLOOR_TAG) != st(src).uid:
+            return False
+        actors = footage_objects(node)
+        return floor_sync(floor, wired_image_node(src, 0), scene, wired_image_node(src, 1),
+                          actors[0] if actors else None, key)
+
     if preview is not None:  # this frame has been previewed: show the cache, played as a sequence
         image = preview_image(src, *preview)
         plate = wired_image_node(src, 0)
@@ -2124,6 +2131,7 @@ def sync(
             changed |= _set(user, attr, getattr(plate, attr))
         changed |= _set(user, "use_auto_refresh", True)
         changed |= _set(user, "use_cyclic", False)
+        changed |= floor_update(texture)
         return changed | wire(node.node_tree, "key", settings)
     shown = shown_frames(src, scene.frame_current if scene is not None else None)
     image = shown.image if shown is not None else None
@@ -2137,6 +2145,7 @@ def sync(
     keyed = shown is not None and shown.name == RESULT
     plugged = node.inputs.get(IMAGE_IN) is not None and node.inputs[IMAGE_IN].is_linked
     changed |= wire(node.node_tree, "key" if keyed else ("input" if plugged else "plate"), settings)
+    changed |= floor_update(texture if keyed and image is not None else None)
     return changed
 
 
@@ -4469,7 +4478,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 9
+FLOOR_VERSION = 10
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4541,6 +4550,9 @@ def ensure_floor_group():
         "The node's Alpha Hint here and around (Actor Margin): where it's the actor, it isn't floor")
     add("Hint Strength", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "How much the Alpha Hint keeps the actor out of the floor (0: colour alone decides)")
+    add("Key", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0), about="CorridorKey's key here (its colour)")
+    add("Key Alpha", "NodeSocketFloat", 0.0, 0.0, 1.0, "CorridorKey's key here (its alpha)")
+    add("Key On", "NodeSocketFloat", 0.0, 0.0, 1.0, "1 when the key is known (previewed or rendered)")
     add("Actor Near", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "1 where the floor is about as far from the camera as the actor (their feet), 0 far behind them")
     add("Fill Under Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
@@ -4617,7 +4629,17 @@ def ensure_floor_group():
     group_in = node("NodeGroupInput")
     group_out = node("NodeGroupOutput")
     get = group_in.outputs.get
-    plate, clean = get("Footage"), get("Floor Colour")
+    clean = get("Floor Colour")
+    # with the key known, the floor behind the actor's see-through parts (motion blur, soft
+    # edges, hair) is the plate minus what the actor adds: (plate - key colour x alpha) / (1 - alpha).
+    # Where the key is solid the floor can't be seen, and nothing is darkened (the key covers it).
+    key_alpha = math("MULTIPLY", get("Key Alpha"), get("Key On"), clamp=True)
+    through = math("MAXIMUM", math("SUBTRACT", 1.0, key_alpha), 0.08)
+    behind = vmath("DIVIDE", vmath("SUBTRACT", get("Footage"), vmath("SCALE", get("Key"), scale=key_alpha)),
+                   vmath("SCALE", (1.0, 1.0, 1.0), scale=through))
+    plate = vmath("MAXIMUM", behind, (0.0, 0.0, 0.0))
+    solid = smooth(get("Key Alpha"), 0.85, 0.97)
+    key_on = get("Key On")
 
     # how much of the clean floor is there here (1 unshaded, 0 black): the floor colour, scaled by
     # the baked clean floor's brightness at this spot
@@ -4656,13 +4678,18 @@ def ensure_floor_group():
         on_hue = smooth(math("DIVIDE", hueness(gamma(colour)), own), gate, gate_top)
         return math("MULTIPLY", on_hue, smooth(lit, darkest, math("ADD", darkest, 0.08)))
 
-    floor = floorness(plate, there)
+    here = floorness(plate, there)
+    floor = here
     for index in range(1, len(FLOOR_AROUND) + 1):
         colour = get(f"Around {index}")
         lit = math("DIVIDE", vmath("DOT_PRODUCT", colour, clean), full, clamp=True)
         floor = math("MINIMUM", floor, floorness(colour, lit))
+    # with the key known, its own alpha says where the actor is (above): the checks around and the
+    # hint are for when there's no key yet
+    floor = math("ADD", math("MULTIPLY", floor, math("SUBTRACT", 1.0, key_on)), math("MULTIPLY", here, key_on))
     # the Alpha Hint knows where the actor is: never floor there, however floor-like the colour
-    actor = math("MULTIPLY", get("Actor Hint"), get("Hint Strength"), clamp=True)
+    actor = math("MULTIPLY", math("MULTIPLY", get("Actor Hint"), get("Hint Strength"), clamp=True),
+                 math("SUBTRACT", 1.0, key_on))
     floor = math("MULTIPLY", floor, math("SUBTRACT", 1.0, actor))
     # under the actor: the floor behind them can't be measured, so take the shadow of the floor
     # around them (the floor points of six taps further out, averaged). Where the key is
@@ -4711,6 +4738,7 @@ def ensure_floor_group():
 
     area = math("MULTIPLY", edge, far)  # the plane's edges, the crops, the distance fade
     amount = math("MULTIPLY", math("MAXIMUM", math("MULTIPLY", shade, floor), under), area, clamp=True)
+    amount = math("MULTIPLY", amount, math("SUBTRACT", 1.0, math("MULTIPLY", solid, key_on)))
     ratio = mix(1.0, (0, 0, 0, 1), vmath("DIVIDE", plate, vmath("MAXIMUM", clean, (1e-4, 1e-4, 1e-4))), clamp=True)
     core = mix(math("MULTIPLY", get("Keep Colour"), math("SUBTRACT", 1.0, actor)), get("Shadow Tint"), ratio)
     multiply = mix(amount, (1, 1, 1, 1), core, clamp=True)
@@ -4755,7 +4783,8 @@ FLOOR_TAPS = [  # the blur's taps: the centre, a ring at half the radius, a ring
               (0.866, -0.5),
 ]
 FLOOR_BLUR, FLOOR_ASPECT = "CK Floor Blur", "CK Floor Aspect"
-FLOOR_HINT, FLOOR_HINT_ON = "CK Floor Hint", "CK Floor Hint On"  # the node's Alpha Hint (the actor)
+FLOOR_HINT, FLOOR_HINT_ON = "CK Floor Hint", "CK Floor Hint On"
+FLOOR_KEY, FLOOR_KEY_ON = "CK Floor Key", "CK Floor Key On"  # the key itself (its alpha), when there is one  # the node's Alpha Hint (the actor)
 FLOOR_FILL = "CK Floor Fill Radius"  # how far around the actor the shadow under them is looked for
 FLOOR_REACH = "CK Floor Fill Reach"  # how far in front of / behind the actor (m) the floor gets that fill
 FLOOR_ACTOR_CENTRE = "CK Floor Actor Centre"  # the footage plane's mesh centre, in its own space
@@ -4769,7 +4798,7 @@ FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{j}][{i}
     [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[2][{i}]") for i, a in enumerate("XYZ")]
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 9
+FLOOR_MATERIAL_VERSION = 10
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -4963,6 +4992,19 @@ def build_floor_material(material) -> None:
     links.new(widest, used.inputs[0])
     links.new(hint_on.outputs[0], used.inputs[1])
     links.new(used.outputs[0], group.inputs["Actor Hint"])
+    # the key itself (CorridorKey's result, when previewed or rendered), at this point
+    key = nodes.new("ShaderNodeTexImage")
+    key.name = key.label = FLOOR_KEY
+    key.extension = "EXTEND"
+    key.location = (-300, -2200)
+    links.new(screen, key.inputs["Vector"])
+    links.new(key.outputs["Color"], group.inputs["Key"])
+    links.new(key.outputs["Alpha"], group.inputs["Key Alpha"])
+    key_on = nodes.new("ShaderNodeValue")
+    key_on.name = key_on.label = FLOOR_KEY_ON
+    key_on.outputs[0].default_value = 0.0
+    key_on.location = (-900, -2200)
+    links.new(key_on.outputs[0], group.inputs["Key On"])
     # the plate and the hint further around (Fill Radius): the shadow under the actor comes from there
     fill = nodes.new("ShaderNodeValue")
     fill.name = fill.label = FLOOR_FILL
@@ -5190,7 +5232,7 @@ def floor_actor(material, actor, scene) -> bool:
     return changed
 
 
-def floor_sync(obj, plate, scene=None, hint=None, actor=None) -> bool:
+def floor_sync(obj, plate, scene=None, hint=None, actor=None, key=None) -> bool:
     """The plane's footage: the node's plate, timed as it plays (its clean floor with it), the
     material brought up to date first, the camera's lens and sensor in it."""
     material = obj.active_material
@@ -5218,6 +5260,19 @@ def floor_sync(obj, plate, scene=None, hint=None, actor=None) -> bool:
             user = node.image_user
             for attr in ("frame_start", "frame_offset", "frame_duration"):
                 changed |= _set(user, attr, getattr(plate, attr))
+            changed |= _set(user, "use_auto_refresh", True)
+            changed |= _set(user, "use_cyclic", False)
+    # the key now shown (previewed or rendered), timed as the node plays it
+    key_image = key.image if key is not None else None
+    key_node, key_on = nodes.get(FLOOR_KEY), nodes.get(FLOOR_KEY_ON)
+    if key_on is not None:
+        changed |= _set(key_on.outputs[0], "default_value", 1.0 if key_image is not None else 0.0)
+    if key_node is not None:
+        changed |= _set(key_node, "image", key_image)
+        if key_image is not None:
+            user, source = key_node.image_user, key.image_user
+            for attr in ("frame_start", "frame_offset", "frame_duration"):
+                changed |= _set(user, attr, getattr(source, attr))
             changed |= _set(user, "use_auto_refresh", True)
             changed |= _set(user, "use_cyclic", False)
     # the node's Alpha Hint (the actor), timed as its own node plays it
