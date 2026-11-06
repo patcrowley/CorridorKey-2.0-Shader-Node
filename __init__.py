@@ -2119,6 +2119,7 @@ def sync(
         if floor is None or floor.get(FLOOR_TAG) != st(src).uid:
             return False
         actors = footage_objects(node)
+        bend_lift_check(node)
         return floor_sync(floor, wired_image_node(src, 0), scene, wired_image_node(src, 1),
                           actors[0] if actors else None, key)
 
@@ -2613,8 +2614,8 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     floor_fill_radius: bpy.props.FloatProperty(
         name="Fill Radius", min=0.0, max=0.2, soft_max=0.08, step=0.1, precision=3,
         get=_get_floor_fill_radius, set=_set_floor_fill_radius,
-        description="How far around the actor (share of the frame's height) the shadow carried in under them "
-                    "is taken from",
+        description="How far around the actor (share of the frame's height) the shadow filled in behind them "
+                    "is taken from (a second ring 2.5 times further out reaches past wide legs and feet)",
     )
     floor_fill_reach: bpy.props.FloatProperty(
         name="Fill Reach", min=0.0, max=20.0, soft_max=6.0, step=10, precision=2, unit="LENGTH",
@@ -2629,7 +2630,8 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     )
     bend_lift: bpy.props.FloatProperty(
         name="Lift", default=0.001, min=0.0, max=0.05, unit="LENGTH", precision=4,
-        description="How far above the floor the laid-down part rests", update=_bend_changed,
+        description="How far above the Floor Shadows plane the laid-down part rests (it stays on top, so "
+                    "the shadow filled in behind the actor never darkens them)", update=_bend_changed,
     )
     bend_detail: bpy.props.IntProperty(
         name="Detail", default=6, min=1, max=9, update=_bend_changed,
@@ -4559,7 +4561,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 12
+FLOOR_VERSION = 13
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4643,14 +4645,11 @@ def ensure_floor_group():
     add("Actor Near", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "1 where the floor is about as far from the camera as the actor (their feet), 0 far behind them")
     add("Fill Under Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
-        "Behind the actor the floor can't be seen: carry the shadow next to them in, so it meets their "
-        "feet and legs with no light gap where the key is see-through (motion blur, soft edges)")
-    add("Fill Toward Actor", "NodeSocketFloat", 1.0, 0.0, 1.0,
-        "On keyed frames: carry the strongest shadow within Fill Radius in toward the actor, so it "
-        "reaches their feet and legs instead of stopping short (0: only the shadow as shot)")
+        "Fill Behind Actor: the floor behind the actor can't be seen, so fill it with the shadow of the "
+        "floor around them: the shadow carries on behind their legs and feet with no actor-shaped hole")
     add("Actor Close", "NodeSocketFloat", 1.0, 0.0, 1.0,
         "1 where the floor is about as far from the camera as the actor, in front or behind")
-    for index in range(1, len(FLOOR_AROUND) + 1):
+    for index in range(1, len(FLOOR_FILL_TAPS) + 1):
         add(f"Fill {index}", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
             about="The plate further around (Fill Radius), for the shadow under the actor")
         add(f"Fill Key {index}", "NodeSocketFloat", 0.0, 0.0, 1.0, "The key's alpha there")
@@ -4784,32 +4783,31 @@ def ensure_floor_group():
     actor = math("MULTIPLY", math("MULTIPLY", get("Actor Hint"), get("Hint Strength"), clamp=True),
                  math("SUBTRACT", 1.0, key_on))
     floor = math("MULTIPLY", floor, math("SUBTRACT", 1.0, actor))
-    # under the actor: the floor behind them can't be measured, so take the shadow of the floor
-    # around them (the floor points of six taps further out, averaged). Where the key is
-    # see-through, the floor shows shadowed there as it was, not as a light gap.
+    # behind the actor: the floor there can't be seen, so it takes the shadow of the floor around
+    # them (the floor points of the taps further out, not on the actor, averaged; the inner ring
+    # counts twice). With the key known, its alpha says which taps are on the actor; before it,
+    # the Alpha Hint does.
     total_shade, total_weight = 0.0, 1e-3
-    strongest, actor_by = 0.0, 0.0
-    for index in range(1, len(FLOOR_AROUND) + 1):
+    strength = get("Hint Strength")
+    for index, (dx, dy) in enumerate(FLOOR_FILL_TAPS, start=1):
         colour = get(f"Fill {index}")
         lit = math("DIVIDE", vmath("DOT_PRODUCT", colour, clean), full, clamp=True)
+        hint_there = math("MULTIPLY", math("MULTIPLY", get(f"Fill Hint {index}"), strength, clamp=True),
+                          math("SUBTRACT", 1.0, key_on))
+        key_there = math("MULTIPLY", smooth(get(f"Fill Key {index}"), 0.02, 0.3), key_on)
         weight = math("MULTIPLY", floorness(colour, lit),
-                      math("SUBTRACT", 1.0, math("MULTIPLY", get(f"Fill Hint {index}"), get("Hint Strength"), clamp=True)))
+                      math("SUBTRACT", 1.0, math("MAXIMUM", hint_there, key_there), clamp=True))
+        if index <= len(FLOOR_AROUND):
+            weight = math("MULTIPLY", weight, 2.0)
         total_shade = math("ADD", total_shade, math("MULTIPLY", shading(lit), weight))
         total_weight = math("ADD", total_weight, weight)
-        # keyed frames: the strongest floor shadow around (not on the actor), and whether the actor is near
-        tap_key = math("MULTIPLY", get(f"Fill Key {index}"), key_on, clamp=True)
-        strongest = math("MAXIMUM", strongest, math("MULTIPLY", math("MULTIPLY", shading(lit), floorness(colour, lit)),
-                                                    math("SUBTRACT", 1.0, tap_key)))
-        actor_by = math("MAXIMUM", actor_by, tap_key)
-    # keyed frames: near the actor (within Fill Radius on screen, about their distance from the
-    # camera), the shadow around reaches in to meet them: the floor between their feet and their
-    # shadow isn't left lit
-    toward = math("MULTIPLY", math("MULTIPLY", strongest, actor_by),
-                  math("MULTIPLY", get("Actor Close"), get("Fill Toward Actor")), clamp=True)
-    # only on the floor near the actor's own distance (where they stand), not the floor far
-    # behind their body, which their shadow doesn't reach
-    under = math("MULTIPLY", math("DIVIDE", total_shade, total_weight),
-                 math("MULTIPLY", math("MULTIPLY", actor, get("Fill Under Actor")), get("Actor Near")), clamp=True)
+    around_shade = math("DIVIDE", total_shade, total_weight)
+    # where it goes: on the actor (the hint before the key; the key's alpha after, from its soft
+    # edge in), on the floor about their distance from the camera (their feet, the floor just
+    # behind their legs), not the floor far behind their body, which their shadow doesn't reach
+    covered = math("ADD", math("MULTIPLY", actor, get("Actor Near")),
+                   math("MULTIPLY", math("MULTIPLY", smooth(get("Key Alpha"), 0.05, 0.5), key_on), get("Actor Close")))
+    under = math("MULTIPLY", around_shade, math("MULTIPLY", covered, get("Fill Under Actor")), clamp=True)
 
     # the area: faded towards the plane's edges, and with distance from the camera
     coords = node("ShaderNodeTexCoord")
@@ -4841,9 +4839,10 @@ def ensure_floor_group():
                                         math("MAXIMUM", get("Fade End"), math("ADD", start, 1e-3))))
 
     area = math("MULTIPLY", edge, far)  # the plane's edges, the crops, the distance fade
-    amount = math("MULTIPLY", math("MAXIMUM", math("MAXIMUM", math("MULTIPLY", shade, floor), under), toward), area,
-                  clamp=True)
-    amount = math("MULTIPLY", amount, math("SUBTRACT", 1.0, math("MULTIPLY", solid, key_on)))
+    # the shadow as shot (none where the key is solid: the floor can't be seen there), or the
+    # shadow carried in behind the actor, whichever is stronger
+    direct = math("MULTIPLY", math("MULTIPLY", shade, floor), math("SUBTRACT", 1.0, math("MULTIPLY", solid, key_on)))
+    amount = math("MULTIPLY", math("MAXIMUM", direct, under), area, clamp=True)
     ratio = mix(1.0, (0, 0, 0, 1), vmath("DIVIDE", plate, vmath("MAXIMUM", clean, (1e-4, 1e-4, 1e-4))), clamp=True)
     core = mix(math("MULTIPLY", get("Keep Colour"), math("SUBTRACT", 1.0, actor)), get("Shadow Tint"), ratio)
     multiply = mix(amount, (1, 1, 1, 1), core, clamp=True)
@@ -4903,7 +4902,11 @@ FLOOR_ACTOR_AXES = [(f"CK Floor Actor M{i}{j}", "actor", f"matrix_world[{j}][{i}
     [(f"CK Floor Camera Back {a}", "camera", f"matrix_world[2][{i}]") for i, a in enumerate("XYZ")]
 FLOOR_MARGIN = "CK Floor Margin"  # Actor Margin: how far around (share of the frame's height) floor is checked
 FLOOR_AROUND = [(1.0, 0.0), (0.5, 0.866), (-0.5, 0.866), (-1.0, 0.0), (-0.5, -0.866), (0.5, -0.866)]
-FLOOR_MATERIAL_VERSION = 11
+# the shadow behind the actor comes from the floor around them: a ring at Fill Radius and one
+# (turned half a step) at 2.5 times it, so it reaches past legs and feet wider than the radius
+FLOOR_FILL_TAPS = FLOOR_AROUND + [(round(2.5 * x, 4), round(2.5 * y, 4)) for x, y in
+                                  ((0.866, 0.5), (0.0, 1.0), (-0.866, 0.5), (-0.866, -0.5), (0.0, -1.0), (0.866, -0.5))]
+FLOOR_MATERIAL_VERSION = 12
 FLOOR_LENS, FLOOR_FACTORS = "CK Floor Lens", ("CK Floor KX", "CK Floor KY", "CK Floor SX", "CK Floor SY")
 
 
@@ -5123,7 +5126,7 @@ def build_floor_material(material) -> None:
     fill.name = fill.label = FLOOR_FILL
     fill.outputs[0].default_value = 0.03
     fill.location = (-900, -4400)
-    for index, (dx, dy) in enumerate(FLOOR_AROUND, start=1):
+    for index, (dx, dy) in enumerate(FLOOR_FILL_TAPS, start=1):
         step = nodes.new("ShaderNodeCombineXYZ")
         step.inputs[1].default_value = dy
         across = nodes.new("ShaderNodeMath")
@@ -5219,9 +5222,9 @@ def build_floor_material(material) -> None:
     actor_depth = op("MULTIPLY", vop("DOT_PRODUCT", vop("SUBTRACT", world.outputs[0], vector("CK Floor Camera")),
                                      ahead), -1.0)
     view = nodes.new("ShaderNodeCameraData")
-    # how far behind the actor this floor point is: the fill goes only on floor seen behind them
-    # (through their see-through edges), not where the footage plane itself meets the floor at
-    # their feet, which the see-through shadow plane would otherwise darken
+    # how far behind the actor this floor point is: the fill goes on the floor about their distance
+    # (in front a little, behind up to Fill Reach). Before the key, only behind them: where the
+    # footage plane meets the floor at their feet the hint is rough
     gap = op("SUBTRACT", view.outputs["View Z Depth"], actor_depth)
     reach = nodes.new("ShaderNodeValue")
     reach.name = reach.label = FLOOR_REACH
@@ -6169,7 +6172,7 @@ FLOOR_LABELS = {
     "Lift": "Ignore Faint", "White Point": "Full Shadow At", "Gamma": "Soft Edges", "Density": "Darkness",
     "Shadow Tint": "Colour", "Keep Colour": "Footage Colour", "Hue Gate": "Colour Match",
     "Hue Softness": "Match Softness", "Darkest Shadow": "Ignore Very Dark", "Hint Strength": "Use Alpha Hint",
-    "Fill Under Actor": "Fill Under Actor", "Edge Feather": "Edge Feather", "Fill Toward Actor": "Reach the Actor",
+    "Fill Under Actor": "Fill Behind Actor", "Edge Feather": "Edge Feather",
 }
 FLOOR_PRESETS = {  # Lift, White Point, Gamma, Density
     "SUBTLE": (0.35, 0.9, 0.8, 0.7),
@@ -6278,13 +6281,12 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         detect.label(text="No key: the Alpha Hint finds the actor", icon="MOD_MASK")
     else:
         detect.label(text="No key or hint: found by colour", icon="INFO")
-    toward = detect.column(align=True)
-    if "Fill Toward Actor" in inputs:
-        row = toward.row(align=True)
-        row.active = keyed
-        row.prop(inputs["Fill Toward Actor"], "default_value", text=FLOOR_LABELS["Fill Toward Actor"], slider=True)
+    behind = detect.column(align=True)
+    behind.prop(inputs["Fill Under Actor"], "default_value", text=FLOOR_LABELS["Fill Under Actor"], slider=True)
     if FLOOR_FILL in nodes:
-        toward.prop(settings, "floor_fill_radius", slider=True)
+        behind.prop(settings, "floor_fill_radius", slider=True)
+    if FLOOR_REACH in nodes:
+        behind.prop(settings, "floor_fill_reach", slider=True)
     around = detect.box().column(align=True)
     around.label(text="Frames with no key")
     around.active = not keyed
@@ -6292,10 +6294,6 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         around.prop(inputs["Hint Strength"], "default_value", text=FLOOR_LABELS["Hint Strength"], slider=True)
     if FLOOR_MARGIN in nodes:
         around.prop(settings, "floor_margin", slider=True)
-    if hinted:
-        around.prop(inputs["Fill Under Actor"], "default_value", text="Fill Under Actor", slider=True)
-        if FLOOR_REACH in nodes:
-            around.prop(settings, "floor_fill_reach", slider=True)
 
     crop = _fold(box, settings, "ui_floor_crop", "Crop", "FULLSCREEN_EXIT")
     split = crop.split(factor=0.5)
@@ -6469,8 +6467,29 @@ def _bend_settings(settings) -> None:
         modifier = bend_modifier(obj)
         if modifier is not None:
             tree = modifier.node_group
-            modifier[_socket_id(tree, "Lift")] = settings.bend_lift
+            modifier[_socket_id(tree, "Lift")] = bend_height(settings)
             modifier[_socket_id(tree, "Detail")] = settings.bend_detail
+            obj.update_tag()
+
+
+def bend_height(settings) -> float:
+    """Where the laid-down footage rests: Lift above the Floor Shadows plane, so the actor's laid
+    part is always in front of it (the shadow behind them can't darken their feet)."""
+    return FLOOR_LIFT + settings.bend_lift
+
+
+def bend_lift_check(node) -> None:
+    """Older files laid the footage under the shadow plane: lift it above (only when it's off)."""
+    for obj in footage_objects(node):
+        modifier = bend_modifier(obj)
+        if modifier is None:
+            continue
+        try:
+            key = _socket_id(modifier.node_group, "Lift")
+        except StopIteration:
+            continue
+        if abs(float(modifier.get(key, 0.0)) - bend_height(node.corridorkey_shader)) > 1e-6:
+            modifier[key] = bend_height(node.corridorkey_shader)
             obj.update_tag()
 
 
@@ -6506,7 +6525,7 @@ class CORRIDORKEY_SHADER_OT_floor_bend(_OnSource, bpy.types.Operator):
             modifier.node_group = tree
             modifier[_socket_id(tree, "Floor")] = ref
             modifier[_socket_id(tree, "Camera")] = context.scene.camera
-            modifier[_socket_id(tree, "Lift")] = settings.bend_lift
+            modifier[_socket_id(tree, "Lift")] = bend_height(settings)
             modifier[_socket_id(tree, "Detail")] = settings.bend_detail
             obj.update_tag()
         return {"FINISHED"}
