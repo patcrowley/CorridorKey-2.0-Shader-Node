@@ -2451,6 +2451,56 @@ def _floor_view_update(settings) -> None:
         group.inputs["View"].default_value = float(["RESULT", "MATTE", "FLOOR", "CLEAN"].index(settings.floor_view))
 
 
+def _floor_value_node(settings, name):
+    """One of the floor-shadow material's value nodes, for these node settings (or None)."""
+    obj = bpy.data.objects.get(settings.floor_name) if settings.floor_name else None
+    material = obj.active_material if obj is not None else None
+    return material.node_tree.nodes.get(name) if material is not None and material.node_tree else None
+
+
+def _floor_value_get(settings, name) -> float:
+    value = _floor_value_node(settings, name)
+    return value.outputs[0].default_value if value is not None else 0.0
+
+
+def _floor_value_set(settings, name, number) -> None:
+    value = _floor_value_node(settings, name)
+    if value is not None:
+        value.outputs[0].default_value = number
+
+
+def _get_floor_blur(self):
+    return _floor_value_get(self, FLOOR_BLUR)
+
+
+def _set_floor_blur(self, value):
+    _floor_value_set(self, FLOOR_BLUR, value)
+
+
+def _get_floor_margin(self):
+    return _floor_value_get(self, FLOOR_MARGIN)
+
+
+def _set_floor_margin(self, value):
+    _floor_value_set(self, FLOOR_MARGIN, value)
+
+
+def _get_floor_fill_radius(self):
+    return _floor_value_get(self, FLOOR_FILL)
+
+
+def _set_floor_fill_radius(self, value):
+    _floor_value_set(self, FLOOR_FILL, value)
+
+
+def _get_floor_fill_reach(self):
+    return _floor_value_get(self, FLOOR_REACH)
+
+
+def _set_floor_fill_reach(self, value):
+    _floor_value_set(self, FLOOR_REACH, value)
+
+
 class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     live_preview: bpy.props.BoolProperty(
         name="Live Preview",
@@ -2548,6 +2598,30 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     ui_tips: bpy.props.BoolProperty(name="Tips", default=True)
     ui_floor: bpy.props.BoolProperty(name="Floor Shadows", default=True)
     ui_bend: bpy.props.BoolProperty(name="Lay Footage on Floor", default=True)
+    floor_blur: bpy.props.FloatProperty(
+        name="Smooth Grain", min=0.0, max=0.05, soft_max=0.015, step=0.05, precision=4,
+        get=_get_floor_blur, set=_set_floor_blur,
+        description="Average the footage over this much of the frame's height before measuring shadow: "
+                    "calms film grain (0.003 is a good start)",
+    )
+    floor_margin: bpy.props.FloatProperty(
+        name="Edge Margin", min=0.0, max=0.05, soft_max=0.02, step=0.05, precision=4,
+        get=_get_floor_margin, set=_set_floor_margin,
+        description="How far around the actor (share of the frame's height) is also treated as the actor, "
+                    "so their soft edges don't darken the floor",
+    )
+    floor_fill_radius: bpy.props.FloatProperty(
+        name="Fill Radius", min=0.0, max=0.2, soft_max=0.08, step=0.1, precision=3,
+        get=_get_floor_fill_radius, set=_set_floor_fill_radius,
+        description="How far around the actor (share of the frame's height) the shadow carried in under them "
+                    "is taken from",
+    )
+    floor_fill_reach: bpy.props.FloatProperty(
+        name="Fill Reach", min=0.0, max=20.0, soft_max=6.0, step=10, precision=2, unit="LENGTH",
+        get=_get_floor_fill_reach, set=_set_floor_fill_reach,
+        description="How far behind the actor the floor gets the shadow carried in (behind the legs, "
+                    "not far behind the body)",
+    )
     floor_name: bpy.props.StringProperty(options={"HIDDEN"})
     floor_ref: bpy.props.StringProperty(
         name="Floor", description="The object whose XY plane is the floor (Jetset's shim origin). "
@@ -4485,7 +4559,7 @@ FLOOR_GROUP, FLOOR_TEX, FLOOR_NODE = "CK Floor Shadows", "CK Floor Footage", "CK
 FLOOR_CLEAN = "CK Floor Clean"  # the baked clean-floor brightness, per frame
 FLOOR_TAG = "corridorkey_floor"  # on the plane: the uid of the CorridorKey node it serves
 FLOOR_OWNER = "corridorkey_floor_owner"  # on the plane: the footage plane it was made for
-FLOOR_VERSION = 10
+FLOOR_VERSION = 11
 FLOOR_JOBS: dict[str, dict] = {}  # source uid -> its clean-floor bake
 FLOOR_RANGE = 15.0  # metres: how far the plane reaches where the view runs to the horizon
 FLOOR_LIFT = 0.002  # metres above the floor, clear of a CG floor at Z = 0
@@ -4533,30 +4607,36 @@ def ensure_floor_group():
     add("Clean Floor", "NodeSocketFloat", 0.5, 0.0, 1.0,
         "The unshadowed floor's brightness here, half scale (0.5 = the Floor Colour): the baked clean floor")
     add("Lift", "NodeSocketFloat", 0.1, 0.0, 0.95,
-        "Black point: darkening weaker than this is ignored (uneven light, grain), not shadow")
+        "Ignore Faint: darkening weaker than this is left out (grain, uneven light). Raise it for a "
+        "smaller, cleaner shadow")
     add("White Point", "NodeSocketFloat", 1.0, 0.05, 1.0,
-        "Darkening this strong (or more) becomes a full-strength shadow in the matte")
+        "Full Shadow At: darkening this strong (or more) is a full-strength shadow. Lower it to make "
+        "shadows reach full strength sooner")
     add("Gamma", "NodeSocketFloat", 1.0, 0.1, 4.0,
-        "Above 1: soft, faint shadow edges come up. Below 1: only the cores stay")
-    add("Density", "NodeSocketFloat", 1.0, 0.0, 2.0, "How dark the kept shadows are (1 = as shot)")
+        "Soft Edges: above 1 the faint edges come up (a softer, bigger shadow); below 1 only the "
+        "cores stay (tighter)")
+    add("Density", "NodeSocketFloat", 1.0, 0.0, 2.0, "Darkness: how dark the shadows are (1 = as shot)")
     add("Shadow Tint", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
-        about="The colour at the shadow's core: black is a neutral shadow; a dark colour matches a coloured scene")
+        about="Colour: the shadow's colour at its darkest. Black is neutral; a dark colour matches a coloured scene")
     add("Keep Colour", "NodeSocketFloat", 0.0, 0.0, 1.0,
-        "Use the shadows' own colour from the footage instead of the tint (can carry screen spill)")
+        "Footage Colour: take the shadow's colour from the footage instead of Colour (can carry screen spill)")
     add("Hue Gate", "NodeSocketFloat", 0.45, 0.0, 1.0,
-        "How close to the floor's hue a pixel must be to count as floor, however dark it is (a shadow "
-        "keeps the floor's hue). Raise it if grey or skin-toned things darken, lower it if shadows have holes")
-    add("Hue Softness", "NodeSocketFloat", 0.15, 0.0, 0.5, "How gradually pixels go from 'not floor' to 'floor'")
+        "Colour Match: how close to the floor's colour a pixel must be to count as floor, however dark "
+        "(a shadow keeps the floor's colour). Raise it if grey or skin-toned things darken; lower it if "
+        "shadows have holes")
+    add("Hue Softness", "NodeSocketFloat", 0.15, 0.0, 0.5,
+        "Match Softness: how gradually pixels go from 'not floor' to 'floor'")
     add("Darkest Shadow", "NodeSocketFloat", 0.2, 0.0, 0.9,
-        "Anything darker than this share of the clean floor isn't shadow but something on it (a dark "
-        "suit with screen spill): it's left alone")
+        "Ignore Very Dark: anything darker than this share of the clean floor isn't shadow but something "
+        "on it (a dark suit with screen spill), and is left alone")
     for index in range(1, len(FLOOR_AROUND) + 1):
         add(f"Around {index}", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0),
             about="The plate a little way off (Actor Margin): a point counts as floor only if these do too")
     add("Actor Hint", "NodeSocketFloat", 0.0, 0.0, 1.0,
         "The node's Alpha Hint here and around (Actor Margin): where it's the actor, it isn't floor")
     add("Hint Strength", "NodeSocketFloat", 1.0, 0.0, 1.0,
-        "How much the Alpha Hint keeps the actor out of the floor (0: colour alone decides)")
+        "Use Alpha Hint: how much the Alpha Hint keeps the actor out of the floor on frames with no key "
+        "(0: colour alone decides)")
     add("Key", "NodeSocketColor", (0.0, 0.0, 0.0, 1.0), about="CorridorKey's key here (its colour)")
     add("Key Alpha", "NodeSocketFloat", 0.0, 0.0, 1.0, "CorridorKey's key here (its alpha)")
     add("Key On", "NodeSocketFloat", 0.0, 0.0, 1.0, "1 when the key is known (previewed or rendered)")
@@ -5962,6 +6042,34 @@ class CORRIDORKEY_SHADER_OT_floor_edit(_OnSource, bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CORRIDORKEY_SHADER_OT_floor_preset(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.floor_preset"
+    bl_label = "Shadow Preset"
+    bl_options = {"REGISTER", "UNDO"}
+    kind: bpy.props.EnumProperty(items=[
+        ("SUBTLE", "Subtle", "Only the clearer shadows, kept light"),
+        ("NATURAL", "Natural", "The shadows as shot"),
+        ("STRONG", "Strong", "Fainter shadows come up too, a little darker"),
+        ("DEFAULT", "Reset", "Back to the starting values"),
+    ])
+
+    @classmethod
+    def description(cls, context, properties):
+        return {"SUBTLE": "Subtle: only the clearer shadows, kept light",
+                "NATURAL": "Natural: the shadows as shot",
+                "STRONG": "Strong: fainter shadows come up too, a little darker",
+                "DEFAULT": "Reset Ignore Faint, Full Shadow At, Soft Edges and Darkness"}.get(properties.kind, "")
+
+    def execute(self, context):
+        node, src = node_by_source(self.uid), self.source()
+        group = floor_group_node(floor_object(node, src)) if node is not None and src is not None else None
+        if group is None:
+            return {"CANCELLED"}
+        for name, value in zip(("Lift", "White Point", "Gamma", "Density"), FLOOR_PRESETS[self.kind]):
+            group.inputs[name].default_value = value
+        return {"FINISHED"}
+
+
 class CORRIDORKEY_SHADER_OT_floor_sample(_OnSource, bpy.types.Operator):
     bl_idname = "corridorkey_shader.floor_sample"
     bl_label = "Sample Floor Colour"
@@ -6008,6 +6116,28 @@ class CORRIDORKEY_SHADER_OT_floor_remove(_OnSource, bpy.types.Operator):
         return {"FINISHED"}
 
 
+# Floor Shadows' sliders in plain words: the group's socket (its name stays, so saved files and
+# keyframes keep working) -> what the panel calls it
+FLOOR_LABELS = {
+    "Lift": "Ignore Faint", "White Point": "Full Shadow At", "Gamma": "Soft Edges", "Density": "Darkness",
+    "Shadow Tint": "Colour", "Keep Colour": "Footage Colour", "Hue Gate": "Colour Match",
+    "Hue Softness": "Match Softness", "Darkest Shadow": "Ignore Very Dark", "Hint Strength": "Use Alpha Hint",
+    "Fill Under Actor": "Fill Under Actor", "Edge Feather": "Edge Feather",
+}
+FLOOR_PRESETS = {  # Lift, White Point, Gamma, Density
+    "SUBTLE": (0.35, 0.9, 0.8, 0.7),
+    "NATURAL": (0.15, 0.8, 1.0, 1.0),
+    "STRONG": (0.05, 0.6, 1.3, 1.2),
+    "DEFAULT": (0.1, 1.0, 1.0, 1.0),
+}
+FLOOR_VIEW_NOTES = {
+    "RESULT": "The shadows as they'll render.",
+    "MATTE": "White is shadow that's kept: shape it with the Shadow sliders.",
+    "FLOOR": "White counts as floor: the actor and set pieces should be black.",
+    "CLEAN": "The floor's lighting with no shadows on it (from the bake).",
+}
+
+
 def draw_floor_shadows(layout, node, src, scene) -> None:
     uid, settings = st(src).uid, node.corridorkey_shader
     obj = floor_object(node, src)
@@ -6027,23 +6157,32 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     if "Screen" not in inputs:  # an older plane: the next sync brings it up to date
         box.label(text="Updating the floor plane...", icon="TIME")
         return
+    nodes = obj.active_material.node_tree.nodes
 
     def sliders(where, *names):
         column = where.column(align=True)
         for name in names:
             if name in inputs:
-                column.prop(inputs[name], "default_value", text=name, slider=True)
+                column.prop(inputs[name], "default_value", text=FLOOR_LABELS.get(name, name), slider=True)
         return column
 
+    # what's shown, and what to look for in it
     box.row().prop(settings, "floor_view", expand=True)
+    box.label(text=FLOOR_VIEW_NOTES.get(settings.floor_view, ""), icon="HIDE_OFF")
+    baked = bool(inputs["Clean Floor"].links)
+    if not baked and uid not in FLOOR_JOBS:
+        steps = box.column(align=True)
+        steps.label(text="1  Pick the floor colour (eyedropper on bare floor)", icon="BLANK1")
+        steps.label(text="2  Bake the clean floor", icon="BLANK1")
+        steps.label(text="3  Shape the shadow in the Matte view", icon="BLANK1")
     row = box.row(align=True)
-    row.prop(inputs["Floor Colour"], "default_value", text="Floor")
+    row.prop(inputs["Floor Colour"], "default_value", text="Floor Colour")
     row.operator(CORRIDORKEY_SHADER_OT_floor_sample.bl_idname, text="", icon="EYEDROPPER").uid = uid
 
-    baked = bool(inputs["Clean Floor"].links)
     clean = _fold(box, settings, "ui_floor_clean", "Clean Floor", "LIGHT_AREA",
                   "baking" if uid in FLOOR_JOBS else ("baked" if baked else "not baked"))
     row = clean.row(align=True)
+    row.scale_y = 1.2
     if uid in FLOOR_JOBS:
         row.operator(CORRIDORKEY_SHADER_OT_floor_bake_cancel.bl_idname, icon="CANCEL").uid = uid
     else:
@@ -6051,41 +6190,59 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
                      text="Re-bake Clean Floor" if baked else "Bake Clean Floor", icon="LIGHT_AREA").uid = uid
         if baked:
             row.operator(CORRIDORKEY_SHADER_OT_floor_unbake.bl_idname, text="", icon="X").uid = uid
+    _lines(clean, "Measures the floor's own lighting over the whole shot, so uneven lighting isn't "
+                  "taken for shadow.", "INFO", 40)
     row = clean.row(align=True)
     row.prop(settings, "floor_shadow_time", slider=True)
     row.prop(settings, "floor_clean_softness")
-    if not baked and uid not in FLOOR_JOBS:
-        clean.label(text="Uneven lighting reads as shadow until you bake.", icon="INFO")
 
-    matte = _fold(box, settings, "ui_floor_matte", "Matte", "IMAGE_ALPHA")
-    sliders(matte, "Lift", "White Point", "Gamma")
-    blur = obj.active_material.node_tree.nodes.get(FLOOR_BLUR)
-    if blur is not None:
-        matte.prop(blur.outputs[0], "default_value", text="Blur (share of height)")
+    # the shadow: how much darkening becomes how much shadow, and what it looks like
+    shadow = _fold(box, settings, "ui_floor_matte", "Shadow", "IMAGE_ALPHA")
+    row = shadow.row(align=True)
+    for kind, text in (("SUBTLE", "Subtle"), ("NATURAL", "Natural"), ("STRONG", "Strong")):
+        op = row.operator(CORRIDORKEY_SHADER_OT_floor_preset.bl_idname, text=text)
+        op.uid, op.kind = uid, kind
+    op = row.operator(CORRIDORKEY_SHADER_OT_floor_preset.bl_idname, text="", icon="LOOP_BACK")
+    op.uid, op.kind = uid, "DEFAULT"
+    column = sliders(shadow, "Lift", "White Point")
+    column.separator()
+    column.prop(inputs["Gamma"], "default_value", text=FLOOR_LABELS["Gamma"], slider=True)
+    column.prop(inputs["Density"], "default_value", text=FLOOR_LABELS["Density"], slider=True)
+    if FLOOR_BLUR in nodes:
+        column.prop(settings, "floor_blur", slider=True)
+    _lines(shadow, "Smaller shadow: raise Ignore Faint, or lower Soft Edges. Lighter: lower Darkness.",
+           "INFO", 40)
+    row = shadow.row(align=True)
+    row.prop(inputs["Shadow Tint"], "default_value", text="Colour")
+    row = shadow.row(align=True)
+    row.prop(inputs["Keep Colour"], "default_value", text=FLOOR_LABELS["Keep Colour"], slider=True)
 
-    detect = _fold(box, settings, "ui_floor_detect", "Floor Detection", "RESTRICT_SELECT_OFF")
+    # what counts as floor (only the floor can be shadowed)
+    detect = _fold(box, settings, "ui_floor_detect", "What Counts as Floor", "RESTRICT_SELECT_OFF")
     sliders(detect, "Hue Gate", "Hue Softness", "Darkest Shadow")
+    key_on = nodes.get(FLOOR_KEY_ON)
+    keyed = key_on is not None and key_on.outputs[0].default_value > 0.5
     hint = wired_image_node(src, 1)
-    if hint is not None and hint.image is not None:
-        sliders(detect, "Hint Strength", "Fill Under Actor")
-        fill = obj.active_material.node_tree.nodes.get(FLOOR_FILL)
-        if fill is not None:
-            detect.prop(fill.outputs[0], "default_value", text="Fill Radius (share of height)")
-        reach = obj.active_material.node_tree.nodes.get(FLOOR_REACH)
-        if reach is not None:
-            detect.prop(reach.outputs[0], "default_value", text="Fill Reach (m from the actor)")
-        detect.label(text="The Alpha Hint keeps the actor out of the floor and its bake.", icon="CHECKMARK")
+    hinted = hint is not None and hint.image is not None
+    if keyed:
+        detect.label(text="This frame is keyed: CorridorKey's alpha finds the actor.", icon="CHECKMARK")
+    elif hinted:
+        detect.label(text="Not keyed here: the Alpha Hint finds the actor.", icon="MOD_MASK")
     else:
-        detect.label(text="No Alpha Hint: the actor is found by colour alone.", icon="INFO")
-    margin = obj.active_material.node_tree.nodes.get(FLOOR_MARGIN)
-    if margin is not None:
-        detect.prop(margin.outputs[0], "default_value", text="Actor Margin (share of height)")
-    detect.label(text="View Floor shows what counts: the actor must be black.", icon="INFO")
-
-    look = _fold(box, settings, "ui_floor_look", "Look", "SHADING_RENDERED")
-    sliders(look, "Density")
-    look.prop(inputs["Shadow Tint"], "default_value", text="Tint")
-    sliders(look, "Keep Colour")
+        detect.label(text="Not keyed, no Alpha Hint: colour alone finds the actor.", icon="INFO")
+    around = detect.box().column(align=True)
+    around.label(text="Around the actor (frames with no key)")
+    around.active = not keyed
+    if hinted:
+        around.prop(inputs["Hint Strength"], "default_value", text=FLOOR_LABELS["Hint Strength"], slider=True)
+    if FLOOR_MARGIN in nodes:
+        around.prop(settings, "floor_margin", slider=True)
+    if hinted:
+        around.prop(inputs["Fill Under Actor"], "default_value", text="Fill Under Actor", slider=True)
+        if FLOOR_FILL in nodes:
+            around.prop(settings, "floor_fill_radius", slider=True)
+        if FLOOR_REACH in nodes:
+            around.prop(settings, "floor_fill_reach", slider=True)
 
     crop = _fold(box, settings, "ui_floor_crop", "Crop", "FULLSCREEN_EXIT")
     split = crop.split(factor=0.5)
@@ -7531,6 +7688,7 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_floor_sample,
     CORRIDORKEY_SHADER_OT_floor_edit,
     CORRIDORKEY_SHADER_OT_floor_bend,
+    CORRIDORKEY_SHADER_OT_floor_preset,
     CORRIDORKEY_SHADER_OT_floor_remove,
     CORRIDORKEY_SHADER_OT_floor_bake,
     CORRIDORKEY_SHADER_OT_floor_bake_cancel,
