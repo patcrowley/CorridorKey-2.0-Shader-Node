@@ -2547,6 +2547,7 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     ui_render: bpy.props.BoolProperty(name="Render", default=True)
     ui_tips: bpy.props.BoolProperty(name="Tips", default=True)
     ui_floor: bpy.props.BoolProperty(name="Floor Shadows", default=True)
+    ui_bend: bpy.props.BoolProperty(name="Lay Footage on Floor", default=True)
     floor_name: bpy.props.StringProperty(options={"HIDDEN"})
     floor_ref: bpy.props.StringProperty(
         name="Floor", description="The object whose XY plane is the floor (Jetset's shim origin). "
@@ -3259,18 +3260,22 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
     _draw_input(inputs, node, IMAGE_IN, footage)
     if in_shader_editor:
         inputs.operator(CORRIDORKEY_SHADER_OT_connect.bl_idname, icon="LINKED")
-    draw_floor_shadows(layout, node, src, scene)
-    layout.separator()
 
     # The engine's own settings sections, drawn for the hidden compositor node (their Render
     # section is in the Render box above). Ours slot in between theirs: the Alpha Hint above
-    # Despill, the Tips above Help.
+    # Despill, the Tips above Help. All of CorridorKey together, then the set.
     hooks = {"before_despill": lambda where: draw_alpha_hint(where, node, src, scene, hint),
              "before_help": lambda where: draw_tips(where, node, src, scene)}
     if is_free_source(src):
         draw_free_controls(layout, src, **hooks)
     else:
         draw_paid_controls(layout, src, scene, **hooks)
+
+    # on the virtual set: the floor, the footage laid on it, the real shadows kept on it
+    layout.separator()
+    draw_set_floor(layout, node, src, scene)
+    draw_lay_on_floor(layout, node, src, scene)
+    draw_floor_shadows(layout, node, src, scene)
 
 
 def engine_column(layout, src):
@@ -6008,7 +6013,6 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     views = {"MATTE": "showing the matte", "FLOOR": "showing the floor", "CLEAN": "showing the clean floor"}
     note = ("baking" if uid in FLOOR_JOBS else views.get(settings.floor_view, "on")) if group is not None else ""
     box = _fold(layout, settings, "ui_floor", "Floor Shadows", "MESH_PLANE", note)
-    draw_floor_setup(box, node, src, scene)
     if group is None:
         _lines(box, "Keep the real shadows on the floor: a see-through plane on the floor that "
                     "darkens what's behind it where the footage is shadowed. It follows the camera "
@@ -6296,17 +6300,29 @@ class CORRIDORKEY_SHADER_OT_floor_bend(_OnSource, bpy.types.Operator):
         return {"FINISHED"}
 
 
-def draw_floor_setup(box, node, src, scene) -> None:
-    """The floor object, and laying the footage plane on it."""
-    uid, settings = st(src).uid, node.corridorkey_shader
-    row = box.row(align=True)
+def draw_set_floor(layout, node, src, scene) -> None:
+    """The set's floor: the object Lay Footage on Floor and Floor Shadows both use."""
+    settings = node.corridorkey_shader
+    row = layout.row(align=True)
     row.prop_search(settings, "floor_ref", bpy.data, "objects", text="Floor", icon="EMPTY_AXIS")
     if not settings.floor_ref:
         found = floor_reference(scene)
-        box.label(text=f"Using {found.name}" if found else "Using the world's Z = 0", icon="BLANK1")
+        layout.label(text=f"Using {found.name}" if found else "Using the world's Z = 0", icon="BLANK1")
+
+
+def draw_lay_on_floor(layout, node, src, scene) -> None:
+    """Laying the footage plane on the floor, in its own section."""
+    uid, settings = st(src).uid, node.corridorkey_shader
     laid = any(bend_modifier(o) is not None for o in footage_objects(node))
+    box = _fold(layout, settings, "ui_bend", "Lay Footage on Floor", "MOD_SIMPLEDEFORM", "on" if laid else "")
+    if not laid:
+        _lines(box, "Where the footage plane would go through the floor, fold it onto the floor along "
+                    "the camera's view: the actor stands on the set, and the camera sees the same.",
+               "INFO", 40)
     row = box.row(align=True)
-    row.operator(CORRIDORKEY_SHADER_OT_floor_bend.bl_idname, icon="MOD_SIMPLEDEFORM", depress=laid).uid = uid
+    row.scale_y = 1.2
+    row.operator(CORRIDORKEY_SHADER_OT_floor_bend.bl_idname, text="Laid on the Floor" if laid else "Lay Footage on Floor",
+                 icon="CHECKBOX_HLT" if laid else "MOD_SIMPLEDEFORM", depress=laid).uid = uid
     if laid:
         row = box.row(align=True)
         row.prop(settings, "bend_lift")
