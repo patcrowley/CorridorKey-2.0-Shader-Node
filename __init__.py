@@ -7198,15 +7198,27 @@ def _github(path: str, token: str, raw: bool = False):
     return data if raw else json.loads(data)
 
 
-def _github_file(name: str, token: str) -> bytes:
-    """A file of the add-on on GitHub. Without a token, from raw.githubusercontent.com (no API rate
-    limit); with one (a private repository), through the API."""
+def _latest_commit(token: str) -> tuple[str, str]:
+    """(the branch's newest commit, its title), or (the branch name, "") when the API can't say:
+    files fetched by commit are never a stale cached copy."""
+    try:
+        commit = _github(f"commits/{UPDATE_BRANCH}", token)
+        lines = commit.get("commit", {}).get("message", "").splitlines()
+        return commit.get("sha") or UPDATE_BRANCH, lines[0] if lines else ""
+    except Exception:
+        if token:
+            raise
+        return UPDATE_BRANCH, ""
+
+
+def _github_file(name: str, token: str, ref: str = UPDATE_BRANCH) -> bytes:
+    """A file of the add-on on GitHub, at a commit. Without a token, from raw.githubusercontent.com
+    (no API rate limit); with one (a private repository), through the API."""
     if token:
-        return _github(f"contents/{name}?ref={UPDATE_BRANCH}", token, raw=True)
+        return _github(f"contents/{name}?ref={ref}", token, raw=True)
     import urllib.request
 
-    request = urllib.request.Request(
-        f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/{name}?t={int(time.time())}")
+    request = urllib.request.Request(f"https://raw.githubusercontent.com/{UPDATE_REPO}/{ref}/{name}")
     request.add_header("User-Agent", "CorridorKey-2.0-Blender-add-on")
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
@@ -7260,15 +7272,11 @@ def check_for_update(token: str) -> None:
 
     def work():
         try:
-            manifest = _github_file("blender_manifest.toml", token).decode()
+            ref, title = _latest_commit(token)
+            manifest = _github_file("blender_manifest.toml", token, ref).decode()
             found = re.search(r'^version\s*=\s*"([^"]+)"', manifest, re.M)
             latest = found.group(1) if found else ""
-            try:  # the last change's title (the API; a rate limit only loses this line)
-                commit = _github(f"commits/{UPDATE_BRANCH}", token)
-                message = commit.get("commit", {}).get("message", "").splitlines()
-            except Exception:
-                message = []
-            UPDATE_STATE.update(latest=latest, change=message[0] if message else "")
+            UPDATE_STATE.update(latest=latest, change=title)
             if not latest:
                 UPDATE_STATE.update(status="GitHub's copy has no version.", error=True)
             elif _version_key(latest) > _version_key(installed_version()):
@@ -7302,8 +7310,9 @@ def install_update(token: str) -> None:
 
     def work():
         try:
+            ref, _title = _latest_commit(token)
             try:  # the repository's files (the API), else the add-on's known ones
-                listing = _github(f"contents?ref={UPDATE_BRANCH}", token)
+                listing = _github(f"contents?ref={ref}", token)
                 names = [e["name"] for e in listing if e.get("type") == "file" and _ADDON_FILES.match(e["name"])]
             except Exception:
                 if token:
@@ -7311,7 +7320,7 @@ def install_update(token: str) -> None:
                 names = list(_KNOWN_FILES)
             if "__init__.py" not in names or "blender_manifest.toml" not in names:
                 raise RuntimeError("GitHub's copy is missing the add-on's files")
-            files = {name: _github_file(name, token) for name in names}
+            files = {name: _github_file(name, token, ref) for name in names}
             for name, data in files.items():  # nothing is written unless every file is whole
                 if not data:
                     raise RuntimeError(f"{name} came down empty")
