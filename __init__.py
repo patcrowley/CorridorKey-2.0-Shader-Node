@@ -3345,7 +3345,7 @@ def warnings(src, scene) -> list[tuple[str, str, str | None, str]]:
     if result is not None and result.image is not None and image_missing(result.image):
         found.append(("ERROR", "The rendered key's folder is gone (moved or deleted): the node shows "
                       "the footage until you render again.", None, ""))
-    if scene.render.use_compositing and _autoshot_compositor(scene):
+    if compositor_keys(scene):
         found.append(("ERROR", "The compositor keys the raw plate again and will cover CorridorKey's "
                       "key in your renders.", CORRIDORKEY_SHADER_OT_compositing_off.bl_idname,
                       "Turn Off Compositing"))
@@ -3378,13 +3378,14 @@ class CORRIDORKEY_SHADER_OT_compositing_off(bpy.types.Operator):
     bl_idname = "corridorkey_shader.compositing_off"
     bl_label = "Turn Off Compositing"
     bl_description = (
-        "Render without the compositor (Output Properties > Post Processing > Compositing), so its "
-        "key of the raw plate doesn't cover CorridorKey's"
+        "Turn off the compositor's key of the raw plate (Output Properties > Post Processing > "
+        "Compositing, and in Blender 5.3 the compositor effect running it, for renders and the "
+        "viewport), so it doesn't cover CorridorKey's"
     )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        context.scene.render.use_compositing = False
+        compositing_off(context.scene)
         return {"FINISHED"}
 
 
@@ -3850,7 +3851,7 @@ class CORRIDORKEY_SHADER_OT_lock(bpy.types.Operator):
                     notes.append(f"{owner}: {message}")
             else:
                 failed.append(f"{owner}: {message}")
-        if context.scene.render.use_compositing and _autoshot_compositor(context.scene):
+        if compositor_keys(context.scene):
             notes.append("compositing is on and keys the raw plate: turn it off before sending")
         for line in failed + notes:
             self.report({"WARNING"}, line)
@@ -6918,6 +6919,11 @@ def _material_of(obj):
 
 def _autoshot_compositor(scene) -> bool:
     tree = getattr(scene, "compositing_node_group", None) or getattr(scene, "node_tree", None)
+    return _keys_plate(tree)
+
+
+def _keys_plate(tree) -> bool:
+    """A compositing node tree that keys the raw plate (Autoshot's, once "Zipline", or a Keying node)."""
     if tree is None:
         return False
     for n in tree.nodes:
@@ -6928,6 +6934,33 @@ def _autoshot_compositor(scene) -> bool:
         if n.bl_idname == "CompositorNodeKeying":
             return True
     return False
+
+
+def _keying_effects(scene) -> list:
+    """Blender 5.3's compositor effects (Scene > compositor_effects) that key the raw plate and are
+    on, for renders or for the viewport: 5.3 runs the scene's compositing this way too."""
+    return [e for e in getattr(scene, "compositor_effects", ())
+            if (e.enable_for_render or e.enable_for_preview) and _keys_plate(e.node_group)]
+
+
+def compositor_keys(scene) -> bool:
+    """Something composites a key of the raw plate over CorridorKey's: the scene's compositing
+    (Output Properties > Post Processing), or, in Blender 5.3, a compositor effect."""
+    return bool((scene.render.use_compositing and _autoshot_compositor(scene)) or _keying_effects(scene))
+
+
+def compositing_off(scene) -> bool:
+    """Turn off what keys the raw plate over CorridorKey's: the scene's compositing and, in
+    Blender 5.3, each compositor effect running it (for renders and the viewport). Other effects
+    are left alone. True when anything changed."""
+    changed = False
+    if scene.render.use_compositing and _autoshot_compositor(scene):
+        scene.render.use_compositing = False
+        changed = True
+    for effect in _keying_effects(scene):
+        effect.enable_for_render = effect.enable_for_preview = False
+        changed = True
+    return changed
 
 
 class CORRIDORKEY_SHADER_OT_setup_plane(bpy.types.Operator):
@@ -7016,8 +7049,7 @@ class CORRIDORKEY_SHADER_OT_setup_plane(bpy.types.Operator):
         if made:
             notes.append("added " + ", ".join(made))
         scene = context.scene
-        if self.disable_compositor and scene.render.use_compositing and _autoshot_compositor(scene):
-            scene.render.use_compositing = False
+        if self.disable_compositor and compositing_off(scene):
             notes.append("compositing turned off (it keyed the raw plate over CorridorKey)")
         tick()  # the node takes its footage now
         hinting = False
