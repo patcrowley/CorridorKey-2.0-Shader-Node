@@ -138,13 +138,36 @@ def prefs():
 
 
 def engine() -> str:
-    """'paid' or 'free'."""
+    """'paid' or 'free'. Paid chosen but Corridor's add-on can't run (not on, or refused by this
+    Blender, as 5.3 refuses its current version): the free engine, when it's installed."""
     chosen = getattr(prefs(), "engine", "AUTO")
     if chosen == "PAID":
-        return "paid"
+        return "free" if paid_fallback() else "paid"
     if chosen == "FREE":
         return "free"
     return "paid" if ck() is not None else "free"
+
+
+_FREE_READY = [0.0, None]  # (when checked, problem): the free engine's setup, checked at most every 2 s
+
+
+def free_ready() -> bool:
+    now = time.monotonic()
+    if now - _FREE_READY[0] > 2.0:
+        _FREE_READY[0], _FREE_READY[1] = now, free_setup_problem()
+    return _FREE_READY[1] is None
+
+
+def paid_fallback() -> bool:
+    """Paid chosen, Corridor's add-on can't run, the free engine can: use the free one."""
+    return ck() is None and free_ready()
+
+
+def draw_engine_note(layout) -> None:
+    """Under the Engine setting: why the free engine is used though Paid is chosen."""
+    if getattr(prefs(), "engine", "AUTO") == "PAID" and paid_fallback():
+        _lines(layout, (paid_problem() or "Corridor's CorridorKey add-on can't run.") + " Using the free engine.",
+               "INFO", 40)
 
 
 def engine_label() -> str:
@@ -3328,6 +3351,7 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
         row.prop(preferences, "engine", text="Engine")
         row.operator(CORRIDORKEY_SHADER_OT_open_prefs.bl_idname, text="", icon="PREFERENCES")
         row.operator(CORRIDORKEY_SHADER_OT_open_guide.bl_idname, text="", icon="QUESTION")
+        draw_engine_note(layout)
     ck_panel = ck("panel")
     if engine() == "paid" and ck_panel is None:
         problem = paid_problem() or "Corridor's CorridorKey add-on isn't enabled."
@@ -3540,6 +3564,7 @@ class CORRIDORKEY_SHADER_PT_viewport(bpy.types.Panel):
             preferences = prefs()
             if preferences is not None:
                 layout.prop(preferences, "engine", text="Engine")
+                draw_engine_note(layout)
             layout.operator(CORRIDORKEY_SHADER_OT_open_guide.bl_idname, icon="QUESTION")
             return
         node = nodes[0]
@@ -7746,7 +7771,8 @@ class CorridorKey2Preferences(bpy.types.AddonPreferences):
         description="What keys the footage",
         items=[
             ("AUTO", "Automatic", "Corridor's paid add-on when it's enabled, otherwise the free GitHub version"),
-            ("PAID", "Corridor Add-on (paid)", "Corridor Digital's CorridorKey add-on and runtime"),
+            ("PAID", "Corridor Add-on (paid)", "Corridor Digital's CorridorKey add-on and runtime (the free "
+                     "engine stands in while it can't run, as in a Blender version it doesn't support)"),
             ("FREE", "Free (GitHub)", "The free CorridorKey 2.0 from GitHub, run with its own Python"),
         ],
         default="AUTO",
@@ -7781,6 +7807,7 @@ class CorridorKey2Preferences(bpy.types.AddonPreferences):
         draw_updates(layout)
         layout.prop(self, "engine")
         layout.label(text=f"In use: {engine_label()}", icon="CHECKMARK" if engine_available() else "ERROR")
+        draw_engine_note(layout)
         box = layout.box()
         box.label(text="Free CorridorKey 2.0 (GitHub)", icon="URL")
         box.prop(self, "free_root")
