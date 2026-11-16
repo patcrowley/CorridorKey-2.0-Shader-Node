@@ -69,11 +69,17 @@ _RENDERING_WITH_KEY = [False]  # an F12 render that keyed its frame first: keep 
 
 
 def ck(sub: str = ""):
-    """CorridorKey's add-on module (or one of its modules), or None while it isn't enabled."""
+    """CorridorKey's add-on module (or one of its modules), or None while it isn't enabled.
+
+    Only once Blender has loaded it: importing it first (this add-on can start before it, as in
+    Blender 5.3) leaves a module Blender then refuses to enable ("possible name collision")."""
     for name in bpy.context.preferences.addons.keys():
         if name == "corridorkey" or name.endswith(".corridorkey"):
+            module = sys.modules.get(name)
+            if module is None or not getattr(module, "__addon_enabled__", False):
+                return None
             try:
-                return importlib.import_module(f"{name}.{sub}" if sub else name)
+                return importlib.import_module(f"{name}.{sub}") if sub else module
             except ImportError:
                 return None
     return None
@@ -6345,6 +6351,24 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
 BEND_GROUP, BEND_MOD = "CK Lay on Floor", "CK Lay on Floor"
 
 
+def modifier_input(modifier, key, default=None):
+    """A geometry-nodes modifier's input value. Blender 5.3 keeps them in modifier.properties.inputs
+    (the modifier no longer takes ID properties); earlier versions as modifier["Socket_n"]."""
+    inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+    if inputs is not None:
+        item = getattr(inputs, key, None)
+        return item.value if item is not None else default
+    return modifier.get(key, default)
+
+
+def set_modifier_input(modifier, key, value) -> None:
+    inputs = getattr(getattr(modifier, "properties", None), "inputs", None)
+    if inputs is not None:
+        getattr(inputs, key).value = value
+    else:
+        modifier[key] = value
+
+
 def _socket_id(tree, name: str) -> str:
     return next(i.identifier for i in tree.interface.items_tree
                 if getattr(i, "item_type", "") == "SOCKET" and i.in_out == "INPUT" and i.name == name)
@@ -6467,8 +6491,8 @@ def _bend_settings(settings) -> None:
         modifier = bend_modifier(obj)
         if modifier is not None:
             tree = modifier.node_group
-            modifier[_socket_id(tree, "Lift")] = bend_height(settings)
-            modifier[_socket_id(tree, "Detail")] = settings.bend_detail
+            set_modifier_input(modifier, _socket_id(tree, "Lift"), bend_height(settings))
+            set_modifier_input(modifier, _socket_id(tree, "Detail"), settings.bend_detail)
             obj.update_tag()
 
 
@@ -6488,8 +6512,8 @@ def bend_lift_check(node) -> None:
             key = _socket_id(modifier.node_group, "Lift")
         except StopIteration:
             continue
-        if abs(float(modifier.get(key, 0.0)) - bend_height(node.corridorkey_shader)) > 1e-6:
-            modifier[key] = bend_height(node.corridorkey_shader)
+        if abs(float(modifier_input(modifier, key, 0.0)) - bend_height(node.corridorkey_shader)) > 1e-6:
+            set_modifier_input(modifier, key, bend_height(node.corridorkey_shader))
             obj.update_tag()
 
 
@@ -6523,10 +6547,10 @@ class CORRIDORKEY_SHADER_OT_floor_bend(_OnSource, bpy.types.Operator):
         for obj in objects:
             modifier = obj.modifiers.new(BEND_MOD, "NODES")
             modifier.node_group = tree
-            modifier[_socket_id(tree, "Floor")] = ref
-            modifier[_socket_id(tree, "Camera")] = context.scene.camera
-            modifier[_socket_id(tree, "Lift")] = bend_height(settings)
-            modifier[_socket_id(tree, "Detail")] = settings.bend_detail
+            set_modifier_input(modifier, _socket_id(tree, "Floor"), ref)
+            set_modifier_input(modifier, _socket_id(tree, "Camera"), context.scene.camera)
+            set_modifier_input(modifier, _socket_id(tree, "Lift"), bend_height(settings))
+            set_modifier_input(modifier, _socket_id(tree, "Detail"), settings.bend_detail)
             obj.update_tag()
         return {"FINISHED"}
 
@@ -6932,10 +6956,20 @@ def _free_display_changed(state, _context) -> None:
             apply_display(src)
 
 
+def _blend_relative() -> set:
+    """Options for a path property that may start with // (relative to the .blend): Blender 5.3
+    warns about // on a path property without PATH_SUPPORTS_BLEND_RELATIVE."""
+    try:
+        bpy.props.StringProperty(subtype="DIR_PATH", options={"PATH_SUPPORTS_BLEND_RELATIVE"})
+        return {"PATH_SUPPORTS_BLEND_RELATIVE"}
+    except TypeError:
+        return set()
+
+
 class CorridorKeyFreeSettings(bpy.types.PropertyGroup):
     uid: bpy.props.StringProperty(options={"HIDDEN"})
     render_folder: bpy.props.StringProperty(
-        name="Render Folder", subtype="DIR_PATH",
+        name="Render Folder", subtype="DIR_PATH", options=_blend_relative(),
         description="Where full renders are written, each in a Render folder of its own",
     )
     input_linear: bpy.props.BoolProperty(
