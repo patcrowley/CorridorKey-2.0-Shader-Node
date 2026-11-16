@@ -2591,6 +2591,20 @@ def _set_floor_fill_reach(self, value):
     _floor_value_set(self, FLOOR_REACH, value)
 
 
+def _get_floor_show(self):
+    """The shadow plane's own visibility is the truth: shown unless hidden in the viewport or renders."""
+    obj = bpy.data.objects.get(self.floor_name) if self.floor_name else None
+    return obj is not None and not obj.hide_viewport and not obj.hide_render
+
+
+def _set_floor_show(self, value):
+    obj = bpy.data.objects.get(self.floor_name) if self.floor_name else None
+    if obj is not None:
+        obj.hide_viewport = obj.hide_render = not value
+        if value:
+            obj.hide_set(False)
+
+
 class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
     live_preview: bpy.props.BoolProperty(
         name="Live Preview",
@@ -2713,6 +2727,11 @@ class CorridorKeyShaderSettings(bpy.types.PropertyGroup):
                     "not far behind the body)",
     )
     floor_name: bpy.props.StringProperty(options={"HIDDEN"})
+    floor_show: bpy.props.BoolProperty(
+        name="Show Floor Shadows", get=_get_floor_show, set=_set_floor_show,
+        description="Show the ground shadow in the viewport and in renders. Off hides the shadow plane "
+                    "(its settings and clean-floor bake are kept)",
+    )
     floor_ref: bpy.props.StringProperty(
         name="Floor", description="The object whose XY plane is the floor (Jetset's shim origin). "
         "Empty: the camera's top parent when it's an empty, else the world's Z = 0. Fit the plane again after changing it",
@@ -6296,8 +6315,16 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
     obj = floor_object(node, src)
     group = floor_group_node(obj)
     views = {"MATTE": "showing the matte", "FLOOR": "showing the floor", "CLEAN": "showing the clean floor"}
-    note = ("baking" if uid in FLOOR_JOBS else views.get(settings.floor_view, "on")) if group is not None else ""
-    box = _fold(layout, settings, "ui_floor", "Floor Shadows", "MESH_PLANE", note)
+    shown = group is not None and settings.floor_show
+    note = ("baking" if uid in FLOOR_JOBS else views.get(settings.floor_view, "on") if shown else "hidden") \
+        if group is not None else ""
+
+    def show_toggle(header):
+        header.prop(settings, "floor_show", text="", emboss=False,
+                    icon="HIDE_OFF" if settings.floor_show else "HIDE_ON")
+
+    box = _fold(layout, settings, "ui_floor", "Floor Shadows", "MESH_PLANE", note,
+                show_toggle if group is not None else None)
     if group is None:
         _lines(box, "Keep the real shadows on the floor: a see-through plane on the floor that "
                     "darkens what's behind it where the footage is shadowed. It follows the camera "
@@ -6311,6 +6338,10 @@ def draw_floor_shadows(layout, node, src, scene) -> None:
         box.label(text="Updating the floor plane...", icon="TIME")
         return
     nodes = obj.active_material.node_tree.nodes
+    if not shown:
+        _lines(box, "Hidden: no ground shadow in the viewport or in renders. Its settings are kept.",
+               "HIDE_ON", 40)
+        box.prop(settings, "floor_show", text="Show Floor Shadows", toggle=True, icon="HIDE_OFF")
 
     def sliders(where, *names):
         column = where.column(align=True)
