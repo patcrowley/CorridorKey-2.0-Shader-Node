@@ -85,6 +85,50 @@ def ck(sub: str = ""):
     return None
 
 
+def paid_problem() -> str | None:
+    """Why Corridor's add-on can't be used (None when it can): not turned on, or turned on but
+    refused by this Blender (its manifest's version range, as with Blender 5.3)."""
+    if ck() is not None:
+        return None
+    name = next((n for n in bpy.context.preferences.addons.keys()
+                 if n == "corridorkey" or n.endswith(".corridorkey")), None)
+    if name is None:
+        return "Corridor's CorridorKey add-on isn't enabled."
+    low, high = _paid_versions(name)
+    here = bpy.app.version
+    if high is not None and here >= high:
+        return (f"Corridor's CorridorKey add-on supports Blender below {'.'.join(map(str, high))} only "
+                f"(this is {bpy.app.version_string}).")
+    if low is not None and here < low:
+        return f"Corridor's CorridorKey add-on needs Blender {'.'.join(map(str, low))} or later."
+    return "Corridor's CorridorKey add-on is turned on but didn't load (see Window > Toggle System Console)."
+
+
+def _paid_versions(name: str):
+    """(min, max) Blender versions from the paid add-on's extension manifest, (None, None) if unknown."""
+    parts = name.split(".")
+    if len(parts) != 3 or parts[0] != "bl_ext":
+        return None, None
+    repo = next((r for r in bpy.context.preferences.extensions.repos if r.module == parts[1]), None)
+    if repo is None:
+        return None, None
+    try:
+        import tomllib
+        with open(os.path.join(repo.directory, parts[2], "blender_manifest.toml"), "rb") as file:
+            manifest = tomllib.load(file)
+    except (OSError, ValueError, ImportError):
+        return None, None
+
+    def version(text):
+        try:
+            return tuple(int(x) for x in str(text).split(".")[:3])
+        except ValueError:
+            return None
+
+    return (version(manifest["blender_version_min"]) if "blender_version_min" in manifest else None,
+            version(manifest["blender_version_max"]) if "blender_version_max" in manifest else None)
+
+
 # --- engines: Corridor's paid add-on, or the free CorridorKey 2.0 from GitHub ----------------------
 
 
@@ -2367,7 +2411,8 @@ class CORRIDORKEY_SHADER_OT_add_node(bpy.types.Operator):
         if not _in_shader_editor(context):
             return False
         if engine() == "paid" and ck() is None:
-            cls.poll_message_set("Enable Corridor's CorridorKey add-on, or pick the free engine")
+            cls.poll_message_set((paid_problem() or "Corridor's CorridorKey add-on isn't enabled.")
+                                 + " Pick the free engine, or update or enable it.")
             return False
         return True
 
@@ -3154,7 +3199,8 @@ def checklist(src) -> list[tuple[str, bool, str]]:
         problem = free_setup_problem()
         items.append(("Engine: free CorridorKey 2.0", problem is None, problem or "installed"))
     else:
-        items.append(("Engine: Corridor's add-on", ck() is not None, "enabled" if ck() else "not enabled"))
+        problem = paid_problem()
+        items.append(("Engine: Corridor's add-on", problem is None, problem or "enabled"))
     footage = wired_image_node(src, 0)
     image = footage.image if footage is not None else None
     if image is None:
@@ -3284,8 +3330,9 @@ def draw_node(layout: bpy.types.UILayout, node: bpy.types.Node, context, in_shad
         row.operator(CORRIDORKEY_SHADER_OT_open_guide.bl_idname, text="", icon="QUESTION")
     ck_panel = ck("panel")
     if engine() == "paid" and ck_panel is None:
-        layout.label(text="Corridor's CorridorKey add-on isn't enabled.", icon="ERROR")
-        layout.label(text="Enable it, or set Engine to Free (GitHub).")
+        problem = paid_problem() or "Corridor's CorridorKey add-on isn't enabled."
+        _lines(layout, problem, "ERROR", 40)
+        layout.label(text="Update or enable it, or set Engine to Free (GitHub).")
         return
     src = source_of(node)
     footage = wired_image_node(src, 0) if src is not None else None
@@ -6832,7 +6879,8 @@ class CORRIDORKEY_SHADER_OT_setup_plane(bpy.types.Operator):
             cls.poll_message_set("Select a plane whose material shows footage (an Image Texture)")
             return False
         if engine() == "paid" and ck() is None:
-            cls.poll_message_set("Enable Corridor's CorridorKey add-on, or pick the free engine")
+            cls.poll_message_set((paid_problem() or "Corridor's CorridorKey add-on isn't enabled.")
+                                 + " Pick the free engine, or update or enable it.")
             return False
         return True
 
