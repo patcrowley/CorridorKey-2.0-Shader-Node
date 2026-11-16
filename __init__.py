@@ -1265,11 +1265,20 @@ class FreeSession:
             pass
         return request_id
 
-    def _answer(self, request_id: int):
+    def _answer(self, request_id: int, ticket: FreeTicket | None = None):
+        """The worker's answer to a request; its progress on the way, onto the ticket's line."""
         for raw in self._lines:
             line = _parsed(raw)
-            if line is not None and line.get("id") == request_id and "ok" in line:
+            if line is None or line.get("id") != request_id:
+                continue
+            if "ok" in line:
                 return line
+            progress = line.get("progress")
+            if ticket is not None and isinstance(progress, dict):
+                fraction = progress.get("fraction")
+                detail = progress.get("detail") if isinstance(progress.get("detail"), str) else ""
+                percent = f"{int(float(fraction) * 100)}% " if isinstance(fraction, (int, float)) else ""
+                ticket.line = f"{percent}{detail}".strip() or "keying"
         return None
 
     def _open(self, ticket: FreeTicket):
@@ -1318,7 +1327,7 @@ class FreeSession:
         with self._lock:
             self._current = ticket
         ticket.line = "keying"
-        answer = self._answer(self._send(process, {"cmd": "key", **ticket.request}))
+        answer = self._answer(self._send(process, {"cmd": "key", **ticket.request}), ticket)
         with self._lock:
             self._current = None
         exr_dir = exr_dir_of(ticket.request)
@@ -3109,7 +3118,14 @@ GUIDE = "QUICKSTART.html"
 
 
 def _lines(layout, text: str, icon: str = "NONE", width: int = 42) -> None:
-    """A long message as several labels, the icon on the first only."""
+    """A long message as several labels, the icon on the first only. Blender 5.3 and later wrap it
+    to the panel's own width (label_multiline), so nothing is cut off however narrow it is."""
+    if hasattr(layout, "label_multiline"):
+        try:
+            layout.label_multiline(text=text, icon=icon, translate=False)
+            return
+        except TypeError:
+            pass
     for i, part in enumerate(textwrap.wrap(text, width) or [""]):
         layout.label(text=part, icon=icon if i == 0 else ("BLANK1" if icon != "NONE" else "NONE"))
 
@@ -3119,12 +3135,15 @@ _PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 
 def progress_of(line: str) -> float | None:
-    """How far along a status line says a job is ("12 of 240", "40%"), 0-1, or None."""
+    """How far along a status line says a job is ("40%", "12 of 240"), 0-1, or None. A percentage
+    is the whole job's ("62% keying, window 2 of 3"), so it comes first."""
+    found = _PERCENT.search(line or "")
+    if found:
+        return min(1.0, float(found.group(1)) / 100.0)
     found = _FRACTION.search(line or "")
     if found and int(found.group(2)) > 0:
         return min(1.0, int(found.group(1)) / int(found.group(2)))
-    found = _PERCENT.search(line or "")
-    return min(1.0, float(found.group(1)) / 100.0) if found else None
+    return None
 
 
 def draw_progress(layout, line: str, factor: float | None = None, icon: str = "TIME") -> None:
