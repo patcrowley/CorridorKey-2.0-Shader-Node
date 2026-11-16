@@ -698,18 +698,23 @@ def shader_nodes():
                 yield node
 
 
-_LISTED: dict[str, tuple] = {}  # folder -> (its mtime, {frame number: file name}, the numbers)
+_LISTED: dict[str, tuple] = {}  # folder -> (its mtime, {frame number: file name}, the numbers, when listed)
+_RELIST_S = 1.0  # list a folder again after this long, whatever its mtime says
 
 
 def _listed(folder: str) -> tuple:
+    """A folder's numbered frames, listed again when its modified time changes or a second has
+    passed: on some drives (network shares, exFAT) adding a file doesn't change the folder's time,
+    so the time alone would keep an old listing (and Live would key a previewed frame forever)."""
     try:
         stamp = os.stat(folder).st_mtime
     except OSError:
-        return (None, {}, set())
+        return (None, {}, set(), 0.0)
     cached = _LISTED.get(folder)
-    if cached is None or cached[0] != stamp:
+    now = time.monotonic()
+    if cached is None or cached[0] != stamp or now - cached[3] > _RELIST_S:
         names = numbered(folder)
-        cached = (stamp, names, set(names))
+        cached = (stamp, names, set(names), now)
         _LISTED[folder] = cached
     return cached
 
@@ -1868,6 +1873,7 @@ def land_previews() -> bool:
                         os.remove(target)
                     shutil.move(os.path.join(view.output, name), target)
                     kept += 1
+            _LISTED.pop(entry["dir"], None)  # its listing is out of date now, whatever the drive says
         shutil.rmtree(entry["root"], ignore_errors=True)
         if dest:
             src = node_by_uid(uid)
