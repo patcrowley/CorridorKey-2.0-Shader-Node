@@ -1508,6 +1508,56 @@ class FreeControls:
     output: str = "CUTOUT"
     preview_context: int = 4
     screen: str = "GREEN"  # the screen's colour, which the despill takes out: GREEN or BLUE
+    plate_space: str = ""  # a wide-gamut linear colour space the footage is converted from ("" none)
+
+
+_SPACE_MATRIX: dict[str, list | None] = {}
+
+
+def plate_matrix(space: str):
+    """The 3x3 matrix (rows) taking a linear colour space to linear Rec.709, from Blender's own
+    OpenColorIO config; None when the space is Rec.709 already, isn't linear (a log or display
+    space), or can't be worked out. The free engine reads an EXR's numbers as Rec.709, so a
+    wide-gamut plate (ARRI Wide Gamut, ACEScg, Rec.2020...) has to be converted first."""
+    if not space or space in ("Linear Rec.709", "Non-Color", "Raw", "Data"):
+        return None
+    if space in _SPACE_MATRIX:
+        return _SPACE_MATRIX[space]
+    found = None
+    try:
+        import PyOpenColorIO as OCIO
+
+        config = OCIO.Config.CreateFromFile(
+            os.path.join(bpy.utils.resource_path("LOCAL"), "datafiles", "colormanagement", "config.ocio"))
+        cpu = config.getProcessor(space, "Linear Rec.709").getDefaultCPUProcessor()
+        columns = [cpu.applyRGB(list(v)) for v in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))]
+        rows = [[columns[c][r] for c in range(3)] for r in range(3)]
+        linear = True
+        for probe in ((0.25, 0.5, 2.0), (0.01, 0.002, 0.03), (4.0, 1.0, 0.1)):
+            got = cpu.applyRGB(list(probe))
+            want = [sum(rows[r][c] * probe[c] for c in range(3)) for r in range(3)]
+            linear &= all(abs(a - b) <= 1e-4 * max(1.0, abs(b)) for a, b in zip(got, want))
+        identity = all(abs(rows[r][c] - (r == c)) < 1e-5 for r in range(3) for c in range(3))
+        found = rows if linear and not identity else None
+    except Exception:  # no OCIO module or config, or a space it doesn't know
+        found = None
+    _SPACE_MATRIX[space] = found
+    return found
+
+
+def plate_space_note(src) -> tuple[str, str] | None:
+    """(icon, note) about the footage's colour space for the free engine, or None when it's plain."""
+    plate = wired_image_node(src, 0)
+    image = plate.image if plate is not None else None
+    if image is None or not image.filepath.lower().endswith(".exr"):
+        return None
+    space = image.colorspace_settings.name
+    if plate_matrix(space) is not None:
+        return "COLOR", f"Footage is {space}: converted to Rec.709 for the free engine."
+    if space not in ("Linear Rec.709", "Non-Color", "Raw", "Data") and not space.lower().startswith("linear"):
+        return "ERROR", (f"Footage is {space}, which the free engine can't read right: it expects linear "
+                         "or Rec.709 footage. Convert the plates to a linear colour space.")
+    return None
 
 
 _SCREEN_SEEN: dict[str, str] = {}  # footage folder -> the screen colour found in it
@@ -1571,7 +1621,14 @@ def controls_of(src):
     if is_free_source(src):
         controls = free_controls(src.corridorkey2)
         screen = src.corridorkey2.screen
-        return dataclasses.replace(controls, screen=screen_of_footage(src) if screen == "AUTO" else screen)
+        plate = wired_image_node(src, 0)
+        image = plate.image if plate is not None else None
+        space = ""
+        if image is not None and image.filepath.lower().endswith(".exr"):
+            name = image.colorspace_settings.name
+            space = name if plate_matrix(name) is not None else ""
+        return dataclasses.replace(controls, screen=screen_of_footage(src) if screen == "AUTO" else screen,
+                                   plate_space=space)
     return ck("node").controls_of(src.corridorkey)
 
 
@@ -1619,6 +1676,7 @@ def free_request(controls: FreeControls, input_path: str, output_dir: str, hint_
         "frame_dir_linear": controls.input_linear,
         "despill_strength": controls.despill,
         "screen": controls.screen,
+        "input_matrix": plate_matrix(controls.plate_space) if controls.plate_space else None,
         "temp_dir": os.path.join(tempfile.gettempdir(), "corridorkey_v2"),
     }
     return {"input": input_path, "output_dir": output_dir, "hint_first": hint_first,
@@ -1698,6 +1756,8 @@ def cache_dir(uid: str, controls, hint, folder) -> str:
     fields = dataclasses.asdict(controls)
     if fields.get("screen") == "GREEN":  # as before the screen was a setting: green-screen previews keep their folders
         fields.pop("screen")
+    if not fields.get("plate_space"):  # likewise footage that needs no conversion
+        fields.pop("plate_space", None)
     blob = json.dumps([fields, hint, folder], sort_keys=True, default=str)
     return os.path.join(cache_root(), uid[:8], hashlib.sha1(blob.encode()).hexdigest()[:12])
 
@@ -7289,7 +7349,7 @@ def start_free_render(src, scene) -> str | None:
         return state.render_line
     root = bpy.path.abspath(state.render_folder)
     os.makedirs(root, exist_ok=True)
-    controls = free_controls(state)  # a preview keying now finishes first: one model, one queue
+    controls = controls_of(src)  # the screen colour and footage conversion too; a preview finishes first: one model, one queue
     working = os.path.join(root, f".corridorkey_working_{uuid.uuid4().hex[:8]}")
     os.makedirs(working)
     footage = bpy.path.abspath(image.filepath, library=image.library)
@@ -7492,6 +7552,9 @@ def draw_free_controls(outer, src, before_despill=None, before_help=None) -> Non
     body = _section(layout, "controls", "Controls")
     if body:
         body.prop(state, "input_linear")
+        note = plate_space_note(src)
+        if note is not None:
+            _lines(body, note[1], note[0], 40)
         body.prop(state, "internal_resolution")
 
     body = _section(layout, "time", "Time Awareness")

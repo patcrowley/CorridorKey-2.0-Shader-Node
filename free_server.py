@@ -8,7 +8,8 @@ It loads the model once and keys on request, so previews after the first skip th
 object per line on stdin; one per line on stdout (everything the library prints goes to stderr):
 
     -> {"id": 3, "cmd": "key", "input": "<frames dir>", "output_dir": "<dir>",
-        "hint_first": null, "hint_video": "<dir>", "cfg": {..., "screen": "GREEN" or "BLUE"}}
+        "hint_first": null, "hint_video": "<dir>",
+        "cfg": {..., "screen": "GREEN" or "BLUE", "input_matrix": null or 3x3 to linear Rec.709}}
     <- {"id": 3, "progress": {"fraction": 0.5, "detail": "keying"}}     (as it goes)
     <- {"id": 3, "ok": true, "exr_dir": "<dir of index-numbered EXRs>", "suffix": "cutout"}
     -> {"id": 4, "cmd": "park"}            (model to system memory, GPU freed)
@@ -87,6 +88,40 @@ def _despill_by_screen(runtime, torch) -> None:
         return full if strength >= 1.0 else fg * (1.0 - strength) + full * strength
 
     runtime._despill_average_srgb_torch = despill
+
+
+def _to_rec709(folder: str, output_dir: str, matrix) -> str:
+    """Copies of a folder's EXR frames converted to linear Rec.709 by `matrix` (3x3, rows), in a
+    folder of the same name (the clip's name comes from it); other frames are linked as they are.
+    The library reads an EXR's numbers as Rec.709, so a wide-gamut plate would key with the wrong
+    colours. The plates themselves are never changed."""
+    import shutil
+
+    import cv2
+    import numpy as np
+
+    target = os.path.join(output_dir, "_rec709", os.path.basename(os.path.normpath(folder)))
+    os.makedirs(target, exist_ok=True)
+    m = np.asarray(matrix, dtype=np.float32)
+    flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT]
+    for name in sorted(os.listdir(folder)):
+        source, dest = os.path.join(folder, name), os.path.join(target, name)
+        if not name.lower().endswith(".exr"):
+            try:
+                os.link(source, dest)
+            except OSError:
+                shutil.copy2(source, dest)
+            continue
+        image = cv2.imread(source, cv2.IMREAD_UNCHANGED)
+        if image is None or image.ndim != 3 or image.shape[2] < 3:
+            shutil.copy2(source, dest)
+            continue
+        image = image.astype(np.float32, copy=False)
+        rgb = image[..., 2::-1] @ m.T  # OpenCV keeps BGR
+        image[..., :3] = rgb[..., ::-1]
+        if not cv2.imwrite(dest, image, flags):
+            raise RuntimeError(f"couldn't write the converted frame {dest}")
+    return target
 
 
 class _Steps:
@@ -189,9 +224,13 @@ def main() -> None:
             )
             _SCREEN[0] = "BLUE" if str(c.get("screen", "GREEN")).upper() == "BLUE" else "GREEN"
             _KEYING[0] = rid
+            plates = request["input"]
+            if c.get("input_matrix") and os.path.isdir(plates):
+                say({"id": rid, "progress": {"fraction": 0.02, "detail": "converting the footage's colours"}})
+                plates = _to_rec709(plates, request["output_dir"], c["input_matrix"])
             run_inference(
                 model,
-                request["input"],
+                plates,
                 request["output_dir"],
                 cfg,
                 WriterConfig(),
@@ -200,7 +239,7 @@ def main() -> None:
             )
             name = sorted(outputs)[0] if "cutout" not in outputs else "cutout"
             exr_dir = os.path.join(
-                request["output_dir"], f"{raw_clip_name(request['input'])}_{suffixes[name]}_exr"
+                request["output_dir"], f"{raw_clip_name(plates)}_{suffixes[name]}_exr"
             )
             _KEYING[0] = None
             say({"id": rid, "ok": True, "exr_dir": exr_dir, "suffix": suffixes[name]})
