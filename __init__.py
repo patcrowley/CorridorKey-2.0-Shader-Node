@@ -1507,6 +1507,45 @@ class FreeControls:
     despill: float = 0.7
     output: str = "CUTOUT"
     preview_context: int = 4
+    screen: str = "GREEN"  # the screen's colour, which the despill takes out: GREEN or BLUE
+
+
+_SCREEN_SEEN: dict[str, str] = {}  # footage folder -> the screen colour found in it
+
+
+def screen_of_footage(src) -> str:
+    """GREEN or BLUE: which colour most of the footage's screen is, from a frame in the middle of
+    the shot (looked at once per footage folder)."""
+    plate = wired_image_node(src, 0)
+    image = plate.image if plate is not None else None
+    if image is None or not image.filepath:
+        return "GREEN"
+    path = bpy.path.abspath(image.filepath, library=image.library)
+    folder = os.path.dirname(path)
+    if folder in _SCREEN_SEEN:
+        return _SCREEN_SEEN[folder]
+    found = "GREEN"
+    try:
+        import numpy as np
+
+        names = numbered(folder) if image.source == "SEQUENCE" else {}
+        frame = os.path.join(folder, names[sorted(names)[len(names) // 2]]) if names else path
+        look = bpy.data.images.load(frame, check_existing=False)
+        try:
+            width, height = look.size
+            pixels = np.empty(width * height * 4, np.float32)
+            look.pixels.foreach_get(pixels)
+        finally:
+            bpy.data.images.remove(look)
+        rgb = pixels.reshape(-1, 4)[::7, :3]
+        r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+        blue = np.count_nonzero((b > 0.02) & (b > 1.3 * np.maximum(r, g)))
+        green = np.count_nonzero((g > 0.02) & (g > 1.3 * np.maximum(r, b)))
+        found = "BLUE" if blue > green else "GREEN"
+    except (OSError, RuntimeError, ValueError, IndexError, KeyError):
+        pass
+    _SCREEN_SEEN[folder] = found
+    return found
 
 
 def free_controls(state) -> FreeControls:
@@ -1530,7 +1569,9 @@ def free_controls(state) -> FreeControls:
 
 def controls_of(src):
     if is_free_source(src):
-        return free_controls(src.corridorkey2)
+        controls = free_controls(src.corridorkey2)
+        screen = src.corridorkey2.screen
+        return dataclasses.replace(controls, screen=screen_of_footage(src) if screen == "AUTO" else screen)
     return ck("node").controls_of(src.corridorkey)
 
 
@@ -1577,6 +1618,7 @@ def free_request(controls: FreeControls, input_path: str, output_dir: str, hint_
         "model_scale": controls.model_scale,
         "frame_dir_linear": controls.input_linear,
         "despill_strength": controls.despill,
+        "screen": controls.screen,
         "temp_dir": os.path.join(tempfile.gettempdir(), "corridorkey_v2"),
     }
     return {"input": input_path, "output_dir": output_dir, "hint_first": hint_first,
@@ -1653,7 +1695,10 @@ def cache_root() -> str:
 def cache_dir(uid: str, controls, hint, folder) -> str:
     """Where previews made with exactly these settings, this hint and this footage are kept: a
     change of any of them is a different folder, so an old preview never passes for a new one."""
-    blob = json.dumps([dataclasses.asdict(controls), hint, folder], sort_keys=True, default=str)
+    fields = dataclasses.asdict(controls)
+    if fields.get("screen") == "GREEN":  # as before the screen was a setting: green-screen previews keep their folders
+        fields.pop("screen")
+    blob = json.dumps([fields, hint, folder], sort_keys=True, default=str)
     return os.path.join(cache_root(), uid[:8], hashlib.sha1(blob.encode()).hexdigest()[:12])
 
 
@@ -7183,6 +7228,15 @@ class CorridorKeyFreeSettings(bpy.types.PropertyGroup):
         name="Despill", default=DESPILL, min=0.0, max=1.0,
         description="How much green or blue spill is taken out of the cut-out (0 none, 1 full)",
     )
+    screen: bpy.props.EnumProperty(
+        name="Screen",
+        items=[("AUTO", "Auto", "Find the screen's colour in the footage"),
+               ("GREEN", "Green", "A green screen: the despill takes out green"),
+               ("BLUE", "Blue", "A blue screen: the despill takes out blue, and leaves greens alone")],
+        default="AUTO",
+        description="The screen's colour, which the despill takes out. Green despill on a blue screen "
+                    "would pull a costume's real green out and leave the blue spill",
+    )
     output: bpy.props.EnumProperty(
         name="Output",
         items=[("CUTOUT", "Cut-Out", "The despilled foreground with its alpha"), ("MATTE", "Matte", "The alpha alone")],
@@ -7455,9 +7509,13 @@ def draw_free_controls(outer, src, before_despill=None, before_help=None) -> Non
     body = _section(layout, "output", "Output and Despill")
     if body:
         body.prop(state, "output")
-        row = body.row()
-        row.enabled = state.output == "CUTOUT"
-        row.prop(state, "despill_strength")
+        column = body.column()
+        column.enabled = state.output == "CUTOUT"
+        column.prop(state, "despill_strength")
+        row = column.row(align=True)
+        row.prop(state, "screen", expand=True)
+        if state.screen == "AUTO":
+            column.label(text=f"Found a {screen_of_footage(src).lower()} screen in the footage.", icon="BLANK1")
     if before_help:
         before_help(outer)
 

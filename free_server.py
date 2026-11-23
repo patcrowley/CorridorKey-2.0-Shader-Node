@@ -8,7 +8,7 @@ It loads the model once and keys on request, so previews after the first skip th
 object per line on stdin; one per line on stdout (everything the library prints goes to stderr):
 
     -> {"id": 3, "cmd": "key", "input": "<frames dir>", "output_dir": "<dir>",
-        "hint_first": null, "hint_video": "<dir>", "cfg": {...}}
+        "hint_first": null, "hint_video": "<dir>", "cfg": {..., "screen": "GREEN" or "BLUE"}}
     <- {"id": 3, "progress": {"fraction": 0.5, "detail": "keying"}}     (as it goes)
     <- {"id": 3, "ok": true, "exr_dir": "<dir of index-numbered EXRs>", "suffix": "cutout"}
     -> {"id": 4, "cmd": "park"}            (model to system memory, GPU freed)
@@ -65,6 +65,30 @@ def _step(line: str) -> None:
             return
 
 
+_SCREEN = ["GREEN"]  # the screen of the shot being keyed: what its despill takes out
+
+
+def _despill_by_screen(runtime, torch) -> None:
+    """The library's despill takes out green alone; on a blue screen it would pull a costume's real
+    green out and leave the blue spill. Swap in one that takes out the shot's own screen colour:
+    the excess of that channel over the other two's average, given back to them half each."""
+    original = getattr(runtime, "_despill_average_srgb_torch", None)
+    if original is None:
+        return
+
+    def despill(fg, strength: float = 0.5):
+        if _SCREEN[0] != "BLUE":
+            return original(fg, strength)
+        if strength <= 0.0:
+            return fg
+        r, g, b = fg[:, 0:1], fg[:, 1:2], fg[:, 2:3]
+        spill = (b - (r + g) * 0.5).clamp(min=0.0)
+        full = torch.cat([r + spill * 0.5, g + spill * 0.5, b - spill], dim=1)
+        return full if strength >= 1.0 else fg * (1.0 - strength) + full * strength
+
+    runtime._despill_average_srgb_torch = despill
+
+
 class _Steps:
     """The library's prints and progress bars stay out of the protocol (they go to stderr, the
     log, as before); each line is also read for how far the key has got."""
@@ -110,6 +134,7 @@ def main() -> None:
             run_inference,
         )
         from corridorkey.video_io import WriterConfig, raw_clip_name
+        import corridorkey.runtime as runtime
     except Exception as exc:  # a broken install: say so and stop
         say({"event": "error", "message": f"Couldn't load CorridorKey 2.0: {exc}"})
         traceback.print_exc()
@@ -117,6 +142,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         say({"event": "error", "message": "CorridorKey 2.0 (free) needs an NVIDIA GPU with CUDA."})
         return
+    _despill_by_screen(runtime, torch)
     say({"event": "loading"})
     try:
         model = load_model(RuntimePaths.from_package(root), device="cuda")
@@ -161,6 +187,7 @@ def main() -> None:
                 output_format="exr",
                 exr_dtype=str(c.get("exr_dtype", "half")),
             )
+            _SCREEN[0] = "BLUE" if str(c.get("screen", "GREEN")).upper() == "BLUE" else "GREEN"
             _KEYING[0] = rid
             run_inference(
                 model,
