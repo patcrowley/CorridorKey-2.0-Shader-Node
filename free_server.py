@@ -90,12 +90,18 @@ def _despill_by_screen(runtime, torch) -> None:
     runtime._despill_average_srgb_torch = despill
 
 
+_CONVERTED_KEEP = 300  # converted frames kept for reuse (Live and Cache Ahead come back to the same ones)
+
+
 def _to_rec709(folder: str, output_dir: str, matrix) -> str:
     """Copies of a folder's EXR frames converted to linear Rec.709 by `matrix` (3x3, rows), in a
     folder of the same name (the clip's name comes from it); other frames are linked as they are.
     The library reads an EXR's numbers as Rec.709, so a wide-gamut plate would key with the wrong
-    colours. The plates themselves are never changed."""
+    colours. The plates themselves are never changed. Converted frames are kept (half float) and
+    reused while the plate and the matrix are the same."""
+    import hashlib
     import shutil
+    import tempfile
 
     import cv2
     import numpy as np
@@ -103,24 +109,45 @@ def _to_rec709(folder: str, output_dir: str, matrix) -> str:
     target = os.path.join(output_dir, "_rec709", os.path.basename(os.path.normpath(folder)))
     os.makedirs(target, exist_ok=True)
     m = np.asarray(matrix, dtype=np.float32)
-    flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT]
+    store = os.path.join(tempfile.gettempdir(), "corridorkey_v2", "rec709",
+                         hashlib.sha1(m.tobytes()).hexdigest()[:12])
+    os.makedirs(store, exist_ok=True)
+    flags = [cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_HALF]
+
+    def place(source, dest):
+        try:
+            os.link(source, dest)
+        except OSError:
+            shutil.copy2(source, dest)
+
     for name in sorted(os.listdir(folder)):
         source, dest = os.path.join(folder, name), os.path.join(target, name)
         if not name.lower().endswith(".exr"):
-            try:
-                os.link(source, dest)
-            except OSError:
-                shutil.copy2(source, dest)
+            place(source, dest)
             continue
-        image = cv2.imread(source, cv2.IMREAD_UNCHANGED)
-        if image is None or image.ndim != 3 or image.shape[2] < 3:
-            shutil.copy2(source, dest)
-            continue
-        image = image.astype(np.float32, copy=False)
-        rgb = image[..., 2::-1] @ m.T  # OpenCV keeps BGR
-        image[..., :3] = rgb[..., ::-1]
-        if not cv2.imwrite(dest, image, flags):
-            raise RuntimeError(f"couldn't write the converted frame {dest}")
+        st = os.stat(source)  # the plate itself (staged as a hard link where the disk allows)
+        kept = os.path.join(store, f"{st.st_ino or abs(hash(os.path.realpath(source)))}_{st.st_size}_{int(st.st_mtime)}.exr")
+        if not os.path.isfile(kept):
+            image = cv2.imread(source, cv2.IMREAD_UNCHANGED)
+            if image is None or image.ndim != 3 or image.shape[2] < 3:
+                place(source, dest)
+                continue
+            image = image.astype(np.float32, copy=False)
+            rgb = image[..., 2::-1] @ m.T  # OpenCV keeps BGR
+            image[..., :3] = np.clip(rgb[..., ::-1], -65000.0, 65000.0)
+            partial = kept + ".part.exr"
+            if not cv2.imwrite(partial, image, flags):
+                raise RuntimeError(f"couldn't write the converted frame {kept}")
+            os.replace(partial, kept)
+        else:
+            os.utime(kept)  # recently used
+        place(kept, dest)
+    try:  # keep the store from growing without end: the least recently used go first
+        frames = sorted((os.path.getmtime(os.path.join(store, n)), n) for n in os.listdir(store) if n.endswith(".exr"))
+        for _when, n in frames[:-_CONVERTED_KEEP]:
+            os.remove(os.path.join(store, n))
+    except OSError:
+        pass
     return target
 
 

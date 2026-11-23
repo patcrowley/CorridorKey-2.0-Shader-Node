@@ -1501,7 +1501,7 @@ class FreeControls:
     low_vram: bool = False
     use_alpha_hint: bool = True
     hint_frames: str = "ALL"
-    hint_quality: float = 0.95
+    hint_quality: float = 0.5
     carry_hint: bool = True
     carry_hint_quality: float = 0.95
     despill: float = 0.7
@@ -7274,8 +7274,11 @@ class CorridorKeyFreeSettings(bpy.types.PropertyGroup):
         default="ALL",
     )
     hint_quality: bpy.props.FloatProperty(
-        name="Hint Strength", default=0.95, min=0.0, max=1.0,
-        description="How much CorridorKey trusts the hint (about 0.95 for good mattes, 0.75 for rough ones)",
+        name="Hint Strength", default=0.5, min=0.0, max=1.0,
+        description="How much the free engine follows the hint. It follows a strong hint's shape closely, "
+                    "so a rough matte (Jetset's AI matte, SAM 3) gives hard, blobby edges at 0.95: about 0.5 "
+                    "keeps the hint picking the subject and lets the model find hair and soft edges. Turn "
+                    "the hint off when the subject is clear on the screen",
     )
     carry_hint: bpy.props.BoolProperty(
         name="Carry Hint", default=True,

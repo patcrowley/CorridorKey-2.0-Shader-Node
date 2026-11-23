@@ -176,6 +176,7 @@ a { color: var(--accent); }
 <tr><td>Out of GPU memory</td><td>Turn on Low GPU Memory, lower the Internal Resolution, key a shorter range, or close other apps that use the GPU.</td></tr>
 <tr><td>Blue screen: colours look wrong (a green costume comes out beige, blue on the edges)</td><td>With the free engine, set <span class="ui">Output and Despill &gt; Screen</span> to <span class="ui">Blue</span> (<span class="ui">Auto</span> finds it in the footage), so the despill takes out blue and leaves real greens alone.</td></tr>
 <tr><td>Free engine: colours and edges off on camera-original EXRs</td><td>Set the footage's colour space on its Image node (for example Linear ARRI Wide Gamut 3 or ACEScg). The free engine reads EXRs as Rec.709, so CorridorKey 2.0 converts wide-gamut linear footage to Rec.709 for it; the Controls section says when it does. Log footage (LogC, S-Log...) needs converting to linear first.</td></tr>
+<tr><td>Free engine: hard, blobby edges on hair</td><td>The free engine follows a strong Alpha Hint's shape closely, so a rough matte (Jetset's AI matte, SAM 3) gives hard edges. Lower <span class="ui">Hint Strength</span> to about 0.5, or turn <span class="ui">Use Alpha Hint</span> off when the subject is clear on the screen.</td></tr>
 <tr><td>The first preview is slow</td><td>That's the model loading, about 25 s. Later previews are quick. After a while idle the model leaves the GPU and comes back in a few seconds.</td></tr>
 </table>
 
