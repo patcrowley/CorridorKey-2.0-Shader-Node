@@ -7529,9 +7529,59 @@ def _section(layout, key: str, title: str, closed: bool = False):
     return body
 
 
+HINT_PRESETS = {  # kind: (label, Use Alpha Hint, Hint Strength, tooltip)
+    "CLEAN": ("Clean Screen", False, None,
+              "One clear subject on the screen: no hint, so the model finds hair and soft edges itself "
+              "(closest to Corridor's key in our tests)"),
+    "BUSY": ("Busy Shot", True, 0.5,
+             "Other people or clutter in frame: the hint picks the subject at half strength, so its rough "
+             "outline doesn't harden the edges"),
+    "MATTE": ("Trust Matte", True, 0.95,
+              "A precise hand-made roto: the key follows the hint closely (a rough AI matte gives hard edges)"),
+}
+
+
+def hint_preset_of(state) -> str:
+    """Which Alpha Hint preset the free engine's settings match, or ""."""
+    if not state.use_alpha_hint:
+        return "CLEAN"
+    for kind, (_label, use, strength, _tip) in HINT_PRESETS.items():
+        if use and strength is not None and abs(state.hint_quality - strength) < 0.005:
+            return kind
+    return ""
+
+
+class CORRIDORKEY_SHADER_OT_hint_preset(_OnSource, bpy.types.Operator):
+    bl_idname = "corridorkey_shader.hint_preset"
+    bl_label = "Alpha Hint Preset"
+    bl_options = {"REGISTER", "UNDO"}
+    kind: bpy.props.EnumProperty(items=[(k, v[0], v[3]) for k, v in HINT_PRESETS.items()])
+
+    @classmethod
+    def description(cls, context, properties):
+        label, _use, _strength, tip = HINT_PRESETS.get(properties.kind, ("", None, None, ""))
+        return f"{label}: {tip}" if label else ""
+
+    def execute(self, context):
+        src = self.source()
+        if src is None or not is_free_source(src):
+            return {"CANCELLED"}
+        _label, use, strength, _tip = HINT_PRESETS[self.kind]
+        state = src.corridorkey2
+        state.use_alpha_hint = use
+        if strength is not None:
+            state.hint_quality = strength
+        return {"FINISHED"}
+
+
 def draw_free_hint_settings(layout, src) -> None:
-    """The free engine's Alpha Hint settings."""
+    """The free engine's Alpha Hint settings, with presets for how much to follow the hint."""
     state = src.corridorkey2
+    row = layout.row(align=True)
+    current = hint_preset_of(state)
+    for kind, (label, _use, _strength, _tip) in HINT_PRESETS.items():
+        op = row.operator(CORRIDORKEY_SHADER_OT_hint_preset.bl_idname, text=label, depress=kind == current)
+        op.uid, op.kind = st(src).uid, kind
     layout.prop(state, "use_alpha_hint")
     column = layout.column()
     column.enabled = state.use_alpha_hint
@@ -8082,6 +8132,7 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_floor_edit,
     CORRIDORKEY_SHADER_OT_floor_bend,
     CORRIDORKEY_SHADER_OT_floor_preset,
+    CORRIDORKEY_SHADER_OT_hint_preset,
     CORRIDORKEY_SHADER_OT_floor_remove,
     CORRIDORKEY_SHADER_OT_floor_bake,
     CORRIDORKEY_SHADER_OT_floor_bake_cancel,
