@@ -66,6 +66,34 @@ def _step(line: str) -> None:
             return
 
 
+_GPU_ROOM_GB = 2.5  # left free for Blender (viewport, textures, display) while a key runs
+_GPU_ROOM_SHARE = 0.15  # or this share of the card, whichever is more
+
+
+def _leave_room_on_gpu(runtime, torch) -> None:
+    """The library sizes its windows to the GPU memory free when a key starts, with a 0.3 GB margin.
+    Blender shares the card and takes more as it goes (the viewport, 4K textures), so a long render
+    could run out of memory part-way; on Windows the driver then spills into system memory and the
+    key crawls (a 108-frame 4K render sat at its first window for 20 minutes). Size the windows as
+    if a couple of GB fewer were free."""
+    select = getattr(runtime, "select_vram_profile", None)
+    if select is None or not hasattr(runtime, "apply_auto_vram"):
+        return
+
+    def apply_auto_vram(cfg, shape_hw, num_frames):
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        budget = (free_bytes + torch.cuda.memory_reserved()) / 2**30
+        room = max(_GPU_ROOM_GB, _GPU_ROOM_SHARE * total_bytes / 2**30)
+        budget = max(budget - room, 1.0)
+        chunk, stride, low_vram, estimate = select(shape_hw, num_frames, budget)
+        cfg.hann_chunk, cfg.hann_stride, cfg.low_vram = chunk, stride, low_vram
+        print(f"  Auto VRAM: {budget:.1f} GB to use ({room:.1f} GB left for Blender) at "
+              f"{shape_hw[1]}x{shape_hw[0]} -> hann_chunk={chunk}, hann_stride={stride}, "
+              f"low_vram={low_vram} (estimated peak {estimate:.1f} GB)")
+
+    runtime.apply_auto_vram = apply_auto_vram
+
+
 _SCREEN = ["GREEN"]  # the screen of the shot being keyed: what its despill takes out
 
 
@@ -205,6 +233,7 @@ def main() -> None:
         say({"event": "error", "message": "CorridorKey 2.0 (free) needs an NVIDIA GPU with CUDA."})
         return
     _despill_by_screen(runtime, torch)
+    _leave_room_on_gpu(runtime, torch)
     say({"event": "loading"})
     try:
         model = load_model(RuntimePaths.from_package(root), device="cuda")
