@@ -1669,7 +1669,10 @@ def free_request(controls: FreeControls, input_path: str, output_dir: str, hint_
         "hann_chunk": controls.window,
         "hann_stride": max(1, controls.window // 2),
         "low_vram": controls.low_vram,
-        "carry_hint": controls.carry_hint,
+        # with no hint, carrying the model's own matte from window to window feeds on itself: one
+        # weak window and the key fades to nothing for the rest of a long render (frame 50 of 108
+        # on a blue-screen shot). Without a hint each window keys on its own, like a preview.
+        "carry_hint": controls.carry_hint and controls.use_alpha_hint,
         "hint_quality": controls.hint_quality,
         "carry_hint_quality": controls.carry_hint_quality,
         "model_scale": controls.model_scale,
@@ -7531,8 +7534,8 @@ def _section(layout, key: str, title: str, closed: bool = False):
 
 HINT_PRESETS = {  # kind: (label, Use Alpha Hint, Hint Strength, tooltip)
     "CLEAN": ("Clean Screen", False, None,
-              "One clear subject on the screen: no hint, so the model finds hair and soft edges itself "
-              "(closest to Corridor's key in our tests)"),
+              "A clear subject on the screen: no hint, so the model finds hair and soft edges itself "
+              "(closest to Corridor's key in our tests); each window keys on its own"),
     "BUSY": ("Busy Shot", True, 0.5,
              "Other people or clutter in frame: the hint picks the subject at half strength, so its rough "
              "outline doesn't harden the edges"),
