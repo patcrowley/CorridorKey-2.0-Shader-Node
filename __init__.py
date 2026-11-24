@@ -3434,6 +3434,61 @@ def draw_getting_started(layout, node, src, context, in_shader_editor: bool) -> 
             col.prop(st(src), "render_folder", text="")
 
 
+def hidden_doubles(src, scene) -> list:
+    """Other planes showing this footage that are hidden in the viewport but still on in renders:
+    F12 shows them as a second, offset copy of the shot (an Autoshot plane on another camera, say)."""
+    node = node_by_source(st(src).uid)
+    footage = wired_image_node(src, 0)
+    image = footage.image if footage is not None else None
+    if node is None or image is None or not image.filepath:
+        return []
+    folder = os.path.normcase(os.path.dirname(bpy.path.abspath(image.filepath, library=image.library)))
+    ours = set(footage_objects(node))
+    layer = bpy.context.view_layer
+    found = []
+    for obj in scene.objects:
+        if obj.type != "MESH" or obj in ours or obj.hide_render:
+            continue
+        if obj.users_collection and all(c.hide_render for c in obj.users_collection):
+            continue
+        try:
+            hidden = obj.hide_viewport or obj.hide_get(view_layer=layer)
+        except RuntimeError:
+            continue
+        if not hidden:
+            continue
+        for slot in obj.material_slots:
+            tree = slot.material.node_tree if slot.material is not None else None
+            if tree is not None and any(
+                    n.bl_idname == "ShaderNodeTexImage" and n.image is not None and n.image.filepath
+                    and os.path.normcase(os.path.dirname(bpy.path.abspath(n.image.filepath, library=n.image.library))) == folder
+                    for n in tree.nodes):
+                found.append(obj)
+                break
+    return found
+
+
+class CORRIDORKEY_SHADER_OT_hide_doubles(bpy.types.Operator):
+    bl_idname = "corridorkey_shader.hide_doubles"
+    bl_label = "Turn Off in Renders"
+    bl_description = ("Turn off render visibility for the other planes showing this footage that are hidden in "
+                      "the viewport, so F12 shows the key once")
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        names = []
+        for node in shader_nodes():
+            src = source_of(node)
+            if src is None:
+                continue
+            for obj in hidden_doubles(src, context.scene):
+                obj.hide_render = True
+                names.append(obj.name)
+        if names:
+            self.report({"INFO"}, "Off in renders: " + ", ".join(sorted(set(names))))
+        return {"FINISHED"}
+
+
 def warnings(src, scene) -> list[tuple[str, str, str | None, str]]:
     """(icon, message, operator to fix it, its button text): what would spoil a key or a render."""
     found = []
@@ -3453,6 +3508,12 @@ def warnings(src, scene) -> list[tuple[str, str, str | None, str]]:
     if result is not None and result.image is not None and image_missing(result.image):
         found.append(("ERROR", "The rendered key's folder is gone (moved or deleted): the node shows "
                       "the footage until you render again.", None, ""))
+    doubles = hidden_doubles(src, scene)
+    if doubles:
+        names = ", ".join(o.name for o in doubles[:3]) + (" and more" if len(doubles) > 3 else "")
+        found.append(("ERROR", f"{names} shows this footage too: hidden in the viewport but still on in "
+                      "renders, so F12 shows a second, offset copy of the shot.",
+                      CORRIDORKEY_SHADER_OT_hide_doubles.bl_idname, "Turn Off in Renders"))
     if compositor_keys(scene):
         found.append(("ERROR", "The compositor keys the raw plate again and will cover CorridorKey's "
                       "key in your renders.", CORRIDORKEY_SHADER_OT_compositing_off.bl_idname,
@@ -8141,6 +8202,7 @@ _CLASSES = (
     CORRIDORKEY_SHADER_OT_floor_bend,
     CORRIDORKEY_SHADER_OT_floor_preset,
     CORRIDORKEY_SHADER_OT_hint_preset,
+    CORRIDORKEY_SHADER_OT_hide_doubles,
     CORRIDORKEY_SHADER_OT_floor_remove,
     CORRIDORKEY_SHADER_OT_floor_bake,
     CORRIDORKEY_SHADER_OT_floor_bake_cancel,
