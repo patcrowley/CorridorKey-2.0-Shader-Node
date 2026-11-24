@@ -7404,6 +7404,11 @@ def free_show_result(src, folder: str) -> bool:
         apply_display(src)
         return False
     image = bpy.data.images.load(os.path.join(folder, frames[0]), check_existing=True)
+    if bpy.data.filepath:  # relative to the .blend, so the project folder can move
+        try:
+            image.filepath = bpy.path.relpath(bpy.path.abspath(image.filepath))
+        except ValueError:  # another drive: it stays a full path
+            pass
     image.source = "SEQUENCE" if len(frames) > 1 else "FILE"
     image.reload()
     try:
